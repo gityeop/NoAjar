@@ -1,7 +1,9 @@
 import AppKit
 import Carbon
 import CoreLocation
+import Darwin
 import Foundation
+import IOKit
 import LidAwakeCore
 import Security
 import UniformTypeIdentifiers
@@ -23,6 +25,136 @@ private struct HotKeyShortcut {
         keyCode: UInt32(kVK_ANSI_L),
         carbonModifiers: UInt32(cmdKey | optionKey)
     )
+}
+
+private final class LidBrightnessController {
+    private typealias GetBrightness = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetBrightness = @convention(c) (CGDirectDisplayID, Float) -> Int32
+
+    private let frameworkHandle: UnsafeMutableRawPointer?
+    private let getBrightness: GetBrightness?
+    private let setBrightness: SetBrightness?
+    private var builtInDisplayID: CGDirectDisplayID?
+    private var lastOpenBrightness: Float?
+    private var restoreBrightness: Float?
+    private var isDimmed = false
+
+    init() {
+        frameworkHandle = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY)
+        if let frameworkHandle,
+           let getSymbol = dlsym(frameworkHandle, "DisplayServicesGetBrightness"),
+           let setSymbol = dlsym(frameworkHandle, "DisplayServicesSetBrightness") {
+            getBrightness = unsafeBitCast(getSymbol, to: GetBrightness.self)
+            setBrightness = unsafeBitCast(setSymbol, to: SetBrightness.self)
+        } else {
+            getBrightness = nil
+            setBrightness = nil
+        }
+        builtInDisplayID = findBuiltInDisplayID()
+    }
+
+    deinit {
+        restoreIfNeeded()
+        if let frameworkHandle {
+            dlclose(frameworkHandle)
+        }
+    }
+
+    func sync(noAjarActive: Bool) {
+        guard noAjarActive else {
+            restoreIfNeeded()
+            lastOpenBrightness = nil
+            return
+        }
+
+        if isLidClosed() {
+            dimIfNeeded()
+        } else {
+            restoreIfNeeded()
+            if let brightness = currentBrightness() {
+                lastOpenBrightness = brightness
+            }
+        }
+    }
+
+    func restoreIfNeeded() {
+        guard isDimmed else { return }
+        if let brightness = restoreBrightness ?? lastOpenBrightness {
+            setBrightnessValue(brightness)
+        }
+        restoreBrightness = nil
+        isDimmed = false
+    }
+
+    private func dimIfNeeded() {
+        guard !isDimmed else { return }
+        restoreBrightness = lastOpenBrightness ?? currentBrightness()
+        guard setBrightnessValue(0) else { return }
+        isDimmed = true
+    }
+
+    private func currentBrightness() -> Float? {
+        guard let getBrightness,
+              let displayID = usableBuiltInDisplayID() else { return nil }
+
+        var brightness: Float = 0
+        guard getBrightness(displayID, &brightness) == 0 else { return nil }
+        return min(max(brightness, 0), 1)
+    }
+
+    @discardableResult
+    private func setBrightnessValue(_ brightness: Float) -> Bool {
+        guard let setBrightness,
+              let displayID = usableBuiltInDisplayID() else { return false }
+
+        let clamped = min(max(brightness, 0), 1)
+        return setBrightness(displayID, clamped) == 0
+    }
+
+    private func usableBuiltInDisplayID() -> CGDirectDisplayID? {
+        if let displayID = findBuiltInDisplayID() {
+            builtInDisplayID = displayID
+            return displayID
+        }
+        return builtInDisplayID
+    }
+
+    private func findBuiltInDisplayID() -> CGDirectDisplayID? {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
+            let mainDisplayID = CGMainDisplayID()
+            return CGDisplayIsBuiltin(mainDisplayID) != 0 ? mainDisplayID : nil
+        }
+
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &displays, &count) == .success else {
+            return nil
+        }
+        return displays.first { CGDisplayIsBuiltin($0) != 0 }
+    }
+
+    private func isLidClosed() -> Bool {
+        let entry = IORegistryEntryFromPath(kIOMainPortDefault, "IOService:/IOResources/IOPMrootDomain")
+        guard entry != 0 else { return false }
+        defer { IOObjectRelease(entry) }
+
+        guard let value = IORegistryEntryCreateCFProperty(
+            entry,
+            "AppleClamshellState" as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() else {
+            return false
+        }
+
+        if let isClosed = value as? Bool {
+            return isClosed
+        }
+        if let number = value as? NSNumber {
+            return number.boolValue
+        }
+        return false
+    }
 }
 
 private final class HotKeyRecorderBox: NSView {
@@ -582,12 +714,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private let launchAgent = LaunchAgent(label: "dev.local.noajar")
     private let locationManager = CLLocationManager()
     private let privilegedHelper = PrivilegedNoAjarHelperClient()
+    private let lidBrightnessController = LidBrightnessController()
 
     private var session: LidAwakeSession?
     private var sessionSource: SessionSource?
     private var activeMode: AwakeMode?
     private var sessionEndsAt: Date?
     private var monitorTimer: Timer?
+    private var lidBrightnessTimer: Timer?
     private var hotKeyController: HotKeyController?
     private var isRecordingHotKey = false
 
@@ -617,11 +751,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
                 self?.monitorTick()
             }
         }
+        lidBrightnessTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.syncLidBrightness()
+            }
+        }
         rebuildMenu()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        monitorTimer?.invalidate()
+        lidBrightnessTimer?.invalidate()
         stopSession()
+        lidBrightnessController.restoreIfNeeded()
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -1273,6 +1415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             activeMode = mode
             sessionEndsAt = duration.map { Date().addingTimeInterval($0) }
             lastMessage = nil
+            syncLidBrightness()
             rebuildMenu()
         } catch {
             lastMessage = error.localizedDescription
@@ -1287,6 +1430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     }
 
     private func stopSession() {
+        let shouldRestoreBrightness = activeMode == .noAjar
         if activeMode == .noAjar {
             do {
                 try privilegedHelper.setNoAjarActive(false)
@@ -1299,13 +1443,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         sessionSource = nil
         activeMode = nil
         sessionEndsAt = nil
+        if shouldRestoreBrightness {
+            lidBrightnessController.restoreIfNeeded()
+        }
     }
 
     private func monitorTick() {
+        syncLidBrightness()
         checkSafety()
         checkWiFiGuard()
         evaluateAutomation()
         rebuildMenu()
+    }
+
+    private func syncLidBrightness() {
+        lidBrightnessController.sync(noAjarActive: session != nil && activeMode == .noAjar)
     }
 
     private func checkSafety() {
