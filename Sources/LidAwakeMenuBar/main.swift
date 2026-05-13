@@ -4,6 +4,7 @@ import CoreLocation
 import Darwin
 import Foundation
 import IOKit
+import IOKit.hid
 import LidAwakeCore
 import Security
 import UniformTypeIdentifiers
@@ -31,10 +32,17 @@ private final class LidBrightnessController {
     private typealias GetBrightness = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
     private typealias SetBrightness = @convention(c) (CGDirectDisplayID, Float) -> Int32
 
+    private static let lidAngleDimThreshold = 20.0
+    private static let lidAngleRestoreThreshold = 25.0
+    private static let noHIDOptions = IOOptionBits(kIOHIDOptionsTypeNone)
+
     private let frameworkHandle: UnsafeMutableRawPointer?
     private let getBrightness: GetBrightness?
     private let setBrightness: SetBrightness?
     private var builtInDisplayID: CGDirectDisplayID?
+    private var lidAngleDevice: IOHIDDevice?
+    private var isLidAngleDeviceOpen = false
+    private var lidAngleReport = [UInt8](repeating: 0, count: 8)
     private var lastOpenBrightness: Float?
     private var restoreBrightness: Float?
     private var isDimmed = false
@@ -51,10 +59,12 @@ private final class LidBrightnessController {
             setBrightness = nil
         }
         builtInDisplayID = findBuiltInDisplayID()
+        lidAngleDevice = findLidAngleDevice()
     }
 
     deinit {
         restoreIfNeeded()
+        closeLidAngleDevice()
         if let frameworkHandle {
             dlclose(frameworkHandle)
         }
@@ -67,7 +77,7 @@ private final class LidBrightnessController {
             return
         }
 
-        if isLidClosed() {
+        if shouldDimForCurrentLidPosition() {
             dimIfNeeded()
         } else {
             restoreIfNeeded()
@@ -131,6 +141,87 @@ private final class LidBrightnessController {
             return nil
         }
         return displays.first { CGDisplayIsBuiltin($0) != 0 }
+    }
+
+    private func shouldDimForCurrentLidPosition() -> Bool {
+        if let angle = currentLidAngle() {
+            let threshold = isDimmed ? Self.lidAngleRestoreThreshold : Self.lidAngleDimThreshold
+            return angle <= threshold
+        }
+        return isLidClosed()
+    }
+
+    private func currentLidAngle() -> Double? {
+        guard let device = usableLidAngleDevice(),
+              openLidAngleDeviceIfNeeded(device) else { return nil }
+
+        var length = CFIndex(lidAngleReport.count)
+        let result = IOHIDDeviceGetReport(
+            device,
+            kIOHIDReportTypeFeature,
+            1,
+            &lidAngleReport,
+            &length
+        )
+
+        guard result == kIOReturnSuccess, length >= 3 else { return nil }
+        let rawValue = UInt16(lidAngleReport[2]) << 8 | UInt16(lidAngleReport[1])
+        return Double(rawValue)
+    }
+
+    private func usableLidAngleDevice() -> IOHIDDevice? {
+        if lidAngleDevice == nil {
+            lidAngleDevice = findLidAngleDevice()
+        }
+        return lidAngleDevice
+    }
+
+    private func openLidAngleDeviceIfNeeded(_ device: IOHIDDevice) -> Bool {
+        guard !isLidAngleDeviceOpen else { return true }
+        guard IOHIDDeviceOpen(device, Self.noHIDOptions) == kIOReturnSuccess else { return false }
+        isLidAngleDeviceOpen = true
+        return true
+    }
+
+    private func closeLidAngleDevice() {
+        guard isLidAngleDeviceOpen, let device = lidAngleDevice else { return }
+        IOHIDDeviceClose(device, Self.noHIDOptions)
+        isLidAngleDeviceOpen = false
+    }
+
+    private func findLidAngleDevice() -> IOHIDDevice? {
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, Self.noHIDOptions)
+        guard IOHIDManagerOpen(manager, Self.noHIDOptions) == kIOReturnSuccess else { return nil }
+        defer { IOHIDManagerClose(manager, Self.noHIDOptions) }
+
+        let matching: [String: Any] = [
+            kIOHIDVendorIDKey as String: 0x05AC,
+            kIOHIDProductIDKey as String: 0x8104,
+            kIOHIDPrimaryUsagePageKey as String: 0x0020,
+            kIOHIDPrimaryUsageKey as String: 0x008A,
+        ]
+        IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
+
+        guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return nil }
+        for device in devices {
+            guard IOHIDDeviceOpen(device, Self.noHIDOptions) == kIOReturnSuccess else { continue }
+            defer { IOHIDDeviceClose(device, Self.noHIDOptions) }
+
+            var report = [UInt8](repeating: 0, count: 8)
+            var length = CFIndex(report.count)
+            let result = IOHIDDeviceGetReport(
+                device,
+                kIOHIDReportTypeFeature,
+                1,
+                &report,
+                &length
+            )
+            if result == kIOReturnSuccess, length >= 3 {
+                return device
+            }
+        }
+
+        return nil
     }
 
     private func isLidClosed() -> Bool {
