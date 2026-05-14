@@ -12,8 +12,8 @@ NoAjar has two user-facing modes:
 
 | Mode | What it does |
 | --- | --- |
-| Awake Mode | Keeps the Mac awake while the lid is open. This uses a normal macOS sleep assertion and does not change lid-close behavior. |
-| No Ajar Mode | Keeps the Mac awake even when the lid is fully closed. This enables `pmset disablesleep 1` while the session is active. |
+| Awake Mode | Keeps the Mac and display awake while the lid is open. This uses normal macOS sleep assertions and does not change lid-close behavior. |
+| No Ajar Mode | Keeps the Mac awake even when the lid is fully closed. This enables `pmset disablesleep 1` and prevents idle display sleep while the session is active. |
 
 The menu bar app keeps the main menu intentionally small:
 
@@ -57,7 +57,7 @@ Wi-Fi includes:
 - Input Blocked Networks: type blocked network names manually.
 - Blocked Wi-Fi: remove blocked SSIDs from the preferred network list and
   disconnect from them during an active session.
-- Allow Wi-Fi Name Access: request permission needed for Personal Hotspot SSID detection.
+- Allow Wi-Fi Name Access: request Location permission needed for Personal Hotspot SSID detection.
   This item is hidden once permission is already granted.
 
 Apps includes:
@@ -85,6 +85,9 @@ Settings includes:
 - Hotkey: opens the NoAjar menu. The default is Cmd-Opt-L and can be changed.
   Use Set Hotkey to record a shortcut by pressing the keys directly.
 - Launch at Login.
+- Check for Updates: checks the latest GitHub Release and opens the download page when a newer version is available.
+- Automatically Check for Updates: checks once per day in the background. NoAjar does not install updates silently.
+- Version: shows the installed app version and build.
 
 Hotkey menu navigation:
 
@@ -115,6 +118,20 @@ Build the app bundle:
 ```sh
 make app
 ```
+
+If a Developer ID Application certificate is installed, `make app` signs the
+app and privileged helper with Hardened Runtime enabled. Otherwise it falls
+back to ad-hoc signing for local development.
+
+Notarize a Developer ID build:
+
+```sh
+make notarize
+```
+
+This uses the `FlowClip-Notary` notarytool keychain profile by default. Override
+it with `NOTARY_PROFILE=...` if needed. Notarization is required for Gatekeeper
+to fully accept a Developer ID build distributed outside your own Mac.
 
 The app bundle is created at:
 

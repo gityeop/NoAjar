@@ -798,6 +798,111 @@ private final class ModeDurationChoice: NSObject {
     }
 }
 
+private struct GitHubRelease: Decodable, Sendable {
+    let tagName: String
+    let name: String?
+    let htmlURL: String?
+    let draft: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case htmlURL = "html_url"
+        case name
+        case draft
+    }
+}
+
+private struct UpdateRelease: Sendable {
+    let version: String
+    let title: String
+    let downloadURL: URL
+}
+
+private enum UpdateCheckResult: Sendable {
+    case updateAvailable(UpdateRelease)
+    case upToDate(latestVersion: String)
+    case failed(String)
+}
+
+private enum NoAjarUpdateChecker {
+    static func check(
+        feedURL: URL,
+        fallbackDownloadURL: URL?,
+        currentVersion: String
+    ) async -> UpdateCheckResult {
+        var request = URLRequest(url: feedURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("NoAjar", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .failed("The update server returned an invalid response.")
+            }
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 404 {
+                    return .failed("The configured update feed was not found.")
+                }
+                return .failed("The update server returned HTTP \(httpResponse.statusCode).")
+            }
+
+            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            guard release.draft != true else {
+                return .failed("The latest release is still marked as a draft.")
+            }
+
+            let latestVersion = normalizedVersion(release.tagName)
+            guard !latestVersion.isEmpty else {
+                return .failed("The latest release has an invalid version tag.")
+            }
+
+            guard isVersion(latestVersion, newerThan: currentVersion) else {
+                return .upToDate(latestVersion: latestVersion)
+            }
+
+            guard let downloadURL = release.htmlURL.flatMap(URL.init(string:)) ?? fallbackDownloadURL else {
+                return .failed("No download page is configured for the update.")
+            }
+
+            return .updateAvailable(UpdateRelease(
+                version: latestVersion,
+                title: release.name ?? "NoAjar \(latestVersion)",
+                downloadURL: downloadURL
+            ))
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    private static func normalizedVersion(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let withoutPrefix = trimmed.hasPrefix("v") || trimmed.hasPrefix("V") ? String(trimmed.dropFirst()) : trimmed
+        return String(withoutPrefix.prefix { character in
+            character.isNumber || character == "."
+        })
+    }
+
+    private static func isVersion(_ candidate: String, newerThan current: String) -> Bool {
+        let candidateParts = numericVersionParts(candidate)
+        let currentParts = numericVersionParts(current)
+        let count = max(candidateParts.count, currentParts.count)
+
+        for index in 0..<count {
+            let left = index < candidateParts.count ? candidateParts[index] : 0
+            let right = index < currentParts.count ? currentParts[index] : 0
+            if left > right { return true }
+            if left < right { return false }
+        }
+        return false
+    }
+
+    private static func numericVersionParts(_ version: String) -> [Int] {
+        normalizedVersion(version)
+            .split(separator: ".")
+            .map { Int($0) ?? 0 }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -829,6 +934,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private var lastAutomationReasons: [String] = []
     private var lastMessage: String?
     private var automationSuppressedUntil: Date?
+    private var wifiGuardCheckInProgress = false
+    private var automaticUpdateChecksEnabled = true
+    private var updateCheckInProgress = false
+    private var scheduledUpdateCheck: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -848,17 +957,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             }
         }
         rebuildMenu()
+        scheduleAutomaticUpdateCheckIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         monitorTimer?.invalidate()
         lidBrightnessTimer?.invalidate()
+        scheduledUpdateCheck?.cancel()
         stopSession()
         lidBrightnessController.restoreIfNeeded()
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor in
+            self.locationManager.stopUpdatingLocation()
+            self.clearResolvedWiFiPermissionMessage()
+            if self.isLocationAuthorizedForWiFiName {
+                self.lastMessage = "Wi-Fi name access is allowed."
+            }
+            self.rebuildMenu()
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        Task { @MainActor in
+            self.locationManager.stopUpdatingLocation()
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in
+            self.locationManager.stopUpdatingLocation()
             self.clearResolvedWiFiPermissionMessage()
             self.rebuildMenu()
         }
@@ -877,6 +1006,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         }
         minBatteryPercent = defaults.object(forKey: "minBatteryPercent") as? Int ?? 30
         batteryStopEnabled = defaults.object(forKey: "batteryGuardEnabled") as? Bool ?? true
+        automaticUpdateChecksEnabled = defaults.object(forKey: "automaticUpdateChecksEnabled") as? Bool ?? true
 
         if let rawMode = defaults.string(forKey: "autoAwakeMode"),
            let mode = AwakeMode(rawValue: rawMode) {
@@ -902,6 +1032,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         defaults.set(minBatteryPercent, forKey: "minBatteryPercent")
         defaults.set(autoAwakeMode.rawValue, forKey: "autoAwakeMode")
         defaults.set(watchedApps, forKey: "watchedApps")
+        defaults.set(automaticUpdateChecksEnabled, forKey: "automaticUpdateChecksEnabled")
     }
 
     private func rebuildMenu() {
@@ -991,10 +1122,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private func clearResolvedWiFiPermissionMessage() {
         guard let lastMessage, isWiFiPermissionMessage(lastMessage) else { return }
 
-        let authorizationStatus = locationManager.authorizationStatus
-        let isAuthorized = authorizationStatus == .authorizedAlways || authorizationStatus == .authorized
-        if isAuthorized || wifiStatus().currentSSID != nil {
+        if isLocationAuthorizedForWiFiName || wifiStatus().currentSSID != nil {
             self.lastMessage = nil
+        }
+    }
+
+    private var isLocationAuthorizedForWiFiName: Bool {
+        switch locationManager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse, .authorized:
+            return true
+        case .notDetermined, .denied, .restricted:
+            return false
+        @unknown default:
+            return false
         }
     }
 
@@ -1085,7 +1225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
 
     private func wifiNameAccessMenuItem() -> NSMenuItem? {
         switch locationManager.authorizationStatus {
-        case .authorizedAlways, .authorized:
+        case .authorizedAlways, .authorizedWhenInUse, .authorized:
             return nil
         case .notDetermined:
             return actionItem("Allow Wi-Fi Name Access", #selector(requestWiFiNameAccess))
@@ -1118,6 +1258,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
 
         submenu.addItem(hotkeyMenuItem())
         submenu.addItem(toggleItem("Launch at Login", #selector(toggleLaunchAtLogin), state: launchAgent.isEnabled))
+        submenu.addItem(.separator())
+        submenu.addItem(actionItem(
+            updateCheckInProgress ? "Checking for Updates..." : "Check for Updates...",
+            #selector(checkForUpdatesClicked),
+            enabled: !updateCheckInProgress
+        ))
+        submenu.addItem(toggleItem(
+            "Automatically Check for Updates",
+            #selector(toggleAutomaticUpdateChecks),
+            state: automaticUpdateChecksEnabled
+        ))
+        submenu.addItem(disabledItem("Version: \(appVersionDisplay())"))
 
         parent.submenu = submenu
         return parent
@@ -1428,6 +1580,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         }
     }
 
+    @objc private func checkForUpdatesClicked() {
+        checkForUpdates(userInitiated: true)
+    }
+
+    @objc private func toggleAutomaticUpdateChecks() {
+        automaticUpdateChecksEnabled.toggle()
+        savePreferences()
+        if automaticUpdateChecksEnabled {
+            scheduleAutomaticUpdateCheckIfNeeded(ignoreLastCheck: true)
+        } else {
+            scheduledUpdateCheck?.cancel()
+            scheduledUpdateCheck = nil
+        }
+        rebuildMenu()
+    }
+
     @objc private func quitClicked() {
         NSApp.terminate(nil)
     }
@@ -1617,38 +1785,166 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             return
         }
 
-        for ssid in blocked {
-            do {
-                try removePreferredWiFi(ssid: ssid)
-            } catch {
-                lastMessage = "Wi-Fi Guard: \(error.localizedDescription)"
-                return
-            }
+        guard !wifiGuardCheckInProgress else { return }
+
+        let currentSSID = status.currentSSID
+        guard force || !blocked.isEmpty || (!cleanPinnedWiFi.isEmpty && currentSSID != cleanPinnedWiFi) else {
+            return
         }
 
-        if let currentSSID = status.currentSSID, blocked.contains(currentSSID) {
+        wifiGuardCheckInProgress = true
+        Task.detached(priority: .utility) { [cleanPinnedWiFi, blocked, currentSSID] in
+            let message: String?
             do {
-                if !cleanPinnedWiFi.isEmpty {
+                for ssid in blocked {
+                    try removePreferredWiFi(ssid: ssid)
+                }
+
+                if let currentSSID, blocked.contains(currentSSID) {
+                    if !cleanPinnedWiFi.isEmpty {
+                        try connectWiFi(ssid: cleanPinnedWiFi)
+                        message = "Wi-Fi Guard moved from \(currentSSID) to \(cleanPinnedWiFi)."
+                    } else {
+                        try disconnectCurrentWiFi()
+                        message = "Wi-Fi Guard disconnected blocked Wi-Fi: \(currentSSID)."
+                    }
+                } else if !cleanPinnedWiFi.isEmpty, currentSSID != cleanPinnedWiFi {
                     try connectWiFi(ssid: cleanPinnedWiFi)
-                    lastMessage = "Wi-Fi Guard moved from \(currentSSID) to \(cleanPinnedWiFi)."
+                    message = "Wi-Fi Guard reconnected to \(cleanPinnedWiFi)."
                 } else {
-                    try disconnectCurrentWiFi()
-                    lastMessage = "Wi-Fi Guard disconnected blocked Wi-Fi: \(currentSSID)."
+                    message = nil
                 }
             } catch {
-                lastMessage = "Wi-Fi Guard: \(error.localizedDescription)"
+                message = "Wi-Fi Guard: \(error.localizedDescription)"
+            }
+
+            await MainActor.run { [weak self] in
+                self?.wifiGuardCheckInProgress = false
+                if let message {
+                    self?.lastMessage = message
+                }
+                self?.rebuildMenu()
+            }
+        }
+    }
+
+    private func scheduleAutomaticUpdateCheckIfNeeded(ignoreLastCheck: Bool = false) {
+        scheduledUpdateCheck?.cancel()
+        scheduledUpdateCheck = nil
+
+        guard automaticUpdateChecksEnabled, !updateCheckInProgress else { return }
+
+        let lastCheck = UserDefaults.standard.object(forKey: "lastUpdateCheckAt") as? Date
+        if !ignoreLastCheck,
+           let lastCheck,
+           Date().timeIntervalSince(lastCheck) < 24 * 60 * 60 {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.scheduledUpdateCheck = nil
+                self?.checkForUpdates(userInitiated: false)
+            }
+        }
+        scheduledUpdateCheck = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: workItem)
+    }
+
+    private func checkForUpdates(userInitiated: Bool) {
+        guard !updateCheckInProgress else { return }
+
+        guard let feedURL = updateCheckURL else {
+            if userInitiated {
+                showError("No update feed URL is configured.")
             }
             return
         }
 
-        guard !cleanPinnedWiFi.isEmpty, status.currentSSID != cleanPinnedWiFi else { return }
-
-        do {
-            try connectWiFi(ssid: cleanPinnedWiFi)
-            lastMessage = "Wi-Fi Guard reconnected to \(cleanPinnedWiFi)."
-        } catch {
-            lastMessage = "Wi-Fi Guard: \(error.localizedDescription)"
+        updateCheckInProgress = true
+        if userInitiated {
+            rebuildMenu()
         }
+
+        let currentVersion = currentAppVersion()
+        let fallbackDownloadURL = updateDownloadURL
+
+        Task { [weak self] in
+            let result = await NoAjarUpdateChecker.check(
+                feedURL: feedURL,
+                fallbackDownloadURL: fallbackDownloadURL,
+                currentVersion: currentVersion
+            )
+            self?.finishUpdateCheck(result, userInitiated: userInitiated)
+        }
+    }
+
+    private func finishUpdateCheck(_ result: UpdateCheckResult, userInitiated: Bool) {
+        updateCheckInProgress = false
+        UserDefaults.standard.set(Date(), forKey: "lastUpdateCheckAt")
+        rebuildMenu()
+
+        switch result {
+        case .updateAvailable(let release):
+            showUpdateAvailableAlert(release)
+        case .upToDate(let latestVersion):
+            if userInitiated {
+                showInfo("NoAjar is up to date.", message: "Installed: \(appVersionDisplay())\nLatest: \(latestVersion)")
+            }
+        case .failed(let message):
+            if userInitiated {
+                showError("Update check failed: \(message)")
+            }
+        }
+    }
+
+    private var updateCheckURL: URL? {
+        bundleURL(forInfoKey: "NoAjarUpdateCheckURL")
+    }
+
+    private var updateDownloadURL: URL? {
+        bundleURL(forInfoKey: "NoAjarUpdateDownloadURL") ?? bundleURL(forInfoKey: "NoAjarReleasesURL")
+    }
+
+    private func bundleURL(forInfoKey key: String) -> URL? {
+        guard let rawValue = Bundle.main.object(forInfoDictionaryKey: key) as? String else {
+            return nil
+        }
+        return URL(string: rawValue)
+    }
+
+    private func currentAppVersion() -> String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
+
+    private func appVersionDisplay() -> String {
+        let version = currentAppVersion()
+        guard let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !build.isEmpty else {
+            return version
+        }
+        return "\(version) (\(build))"
+    }
+
+    private func showUpdateAvailableAlert(_ release: UpdateRelease) {
+        let alert = NSAlert()
+        alert.messageText = "NoAjar \(release.version) is available."
+        alert.informativeText = "Installed: \(appVersionDisplay())\nLatest: \(release.title)"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open Download Page")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(release.downloadURL)
+        }
+    }
+
+    private func showInfo(_ title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     private func showError(_ message: String) {
@@ -1671,17 +1967,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private func requestLocationPermissionForWiFiName() {
         switch locationManager.authorizationStatus {
         case .notDetermined:
+            NSApp.activate(ignoringOtherApps: true)
             locationManager.requestWhenInUseAuthorization()
-            lastMessage = "Allow Location access, then try Pin Current Wi-Fi again."
-        case .authorizedAlways, .authorized:
-            lastMessage = nil
+            locationManager.startUpdatingLocation()
+            lastMessage = "Allow Location access in the macOS prompt."
+        case .authorizedAlways, .authorizedWhenInUse, .authorized:
+            locationManager.stopUpdatingLocation()
+            lastMessage = "Wi-Fi name access is already allowed."
         case .denied, .restricted:
+            locationManager.stopUpdatingLocation()
             openPermissionAlert(
                 title: "Location Access Needed",
                 message: "NoAjar needs Location permission to read Wi-Fi names. This is required by macOS for Wi-Fi Guard."
             )
         @unknown default:
+            NSApp.activate(ignoringOtherApps: true)
             locationManager.requestWhenInUseAuthorization()
+            locationManager.startUpdatingLocation()
+            lastMessage = "Allow Location access in the macOS prompt."
         }
     }
 
@@ -1719,8 +2022,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
 
     private func openPrivacySettings() {
         let urls = [
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices",
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices"
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
         ]
         for rawURL in urls {
             guard let url = URL(string: rawURL), NSWorkspace.shared.open(url) else { continue }

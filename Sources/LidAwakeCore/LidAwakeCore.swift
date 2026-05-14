@@ -35,6 +35,10 @@ public enum AwakeMode: String, CaseIterable, Codable {
     public var preventsLidSleep: Bool {
         self == .noAjar
     }
+
+    public var preventsDisplaySleep: Bool {
+        true
+    }
 }
 
 public struct LidAwakeState: Codable {
@@ -133,7 +137,7 @@ public final class LidAwakeSession {
                 type: kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
                 reason: options.reason
             )
-            if options.preventDisplaySleep {
+            if options.preventDisplaySleep || options.mode.preventsDisplaySleep {
                 displayAssertionID = try createSleepAssertion(
                     type: kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
                     reason: "\(options.reason) Display"
@@ -326,10 +330,79 @@ public func connectWiFi(ssid: String) throws {
         throw LidAwakeError("Wi-Fi interface was not found.")
     }
 
-    let result = try run("/usr/sbin/networksetup", ["-setairportnetwork", interface, cleanSSID])
-    guard result.status == 0 else {
-        throw LidAwakeError(result.errorOrOutput(defaultMessage: "Could not connect to Wi-Fi \(cleanSSID)."))
+    if currentWiFiSSID(interface: interface) == cleanSSID {
+        return
     }
+
+    var failures: [String] = []
+    setWiFiPowerOn(interface: interface)
+
+    for attempt in 1...3 {
+        do {
+            try connectWiFiWithNetworkSetup(interface: interface, ssid: cleanSSID)
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+
+        if waitForWiFiSSID(cleanSSID, interface: interface, timeout: 4) {
+            return
+        }
+
+        do {
+            try connectWiFiWithCoreWLAN(interface: interface, ssid: cleanSSID)
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+
+        if waitForWiFiSSID(cleanSSID, interface: interface, timeout: 4) {
+            return
+        }
+
+        if attempt < 3 {
+            Thread.sleep(forTimeInterval: 2)
+        }
+    }
+
+    let detail = failures.last.map { " Last error: \($0)" } ?? ""
+    throw LidAwakeError("Could not reconnect to Wi-Fi \(cleanSSID).\(detail) For Personal Hotspot, make sure the hotspot is discoverable and was joined before.")
+}
+
+private func connectWiFiWithNetworkSetup(interface: String, ssid: String) throws {
+    let result = try run("/usr/sbin/networksetup", ["-setairportnetwork", interface, ssid])
+    guard result.status == 0 else {
+        throw LidAwakeError(result.errorOrOutput(defaultMessage: "networksetup could not connect to \(ssid)."))
+    }
+}
+
+private func connectWiFiWithCoreWLAN(interface: String, ssid: String) throws {
+    guard let coreInterface = CWWiFiClient.shared().interface(withName: interface) else {
+        throw LidAwakeError("CoreWLAN could not open Wi-Fi interface \(interface).")
+    }
+
+    try coreInterface.setPower(true)
+
+    let networks = try coreInterface.scanForNetworks(withName: ssid)
+    guard let network = networks.sorted(by: { $0.rssiValue > $1.rssiValue }).first else {
+        throw LidAwakeError("Pinned Wi-Fi \(ssid) was not visible in scan.")
+    }
+
+    try coreInterface.associate(to: network, password: nil)
+}
+
+private func waitForWiFiSSID(_ ssid: String, interface: String, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if currentWiFiSSID(interface: interface) == ssid {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    } while Date() < deadline
+    return false
+}
+
+private func setWiFiPowerOn(interface: String) {
+    _ = try? run("/usr/sbin/networksetup", ["-setairportpower", interface, "on"])
+    try? CWWiFiClient.shared().interface(withName: interface)?.setPower(true)
 }
 
 public func removePreferredWiFi(ssid: String) throws {
