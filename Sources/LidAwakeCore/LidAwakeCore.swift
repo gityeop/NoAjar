@@ -335,16 +335,22 @@ public func connectWiFi(ssid: String) throws {
     }
 
     var failures: [String] = []
+    let isSavedNetwork = preferredWiFiNetworks(interface: interface).contains(cleanSSID)
+    var wasVisible = false
     setWiFiPowerOn(interface: interface)
 
-    for attempt in 1...3 {
+    for attempt in 1...5 {
+        if scanForWiFiNetwork(interface: interface, ssid: cleanSSID) {
+            wasVisible = true
+        }
+
         do {
             try connectWiFiWithNetworkSetup(interface: interface, ssid: cleanSSID)
         } catch {
             failures.append(error.localizedDescription)
         }
 
-        if waitForWiFiSSID(cleanSSID, interface: interface, timeout: 4) {
+        if waitForWiFiSSID(cleanSSID, interface: interface, timeout: 6) {
             return
         }
 
@@ -354,17 +360,28 @@ public func connectWiFi(ssid: String) throws {
             failures.append(error.localizedDescription)
         }
 
-        if waitForWiFiSSID(cleanSSID, interface: interface, timeout: 4) {
+        if waitForWiFiSSID(cleanSSID, interface: interface, timeout: 6) {
             return
         }
 
-        if attempt < 3 {
+        if attempt == 2 {
+            resetWiFiRadio(interface: interface)
+        }
+
+        if attempt < 5 {
             Thread.sleep(forTimeInterval: 2)
         }
     }
 
-    let detail = failures.last.map { " Last error: \($0)" } ?? ""
-    throw LidAwakeError("Could not reconnect to Wi-Fi \(cleanSSID).\(detail) For Personal Hotspot, make sure the hotspot is discoverable and was joined before.")
+    if !isSavedNetwork {
+        throw LidAwakeError("Pinned Wi-Fi is not saved in macOS. Join \(cleanSSID) once, then pin it again.")
+    }
+    if !wasVisible {
+        throw LidAwakeError("Pinned Wi-Fi is not visible yet. For hotspot, open Personal Hotspot; retrying.")
+    }
+
+    let detail = shortWiFiFailureMessage(from: failures)
+    throw LidAwakeError("Could not reconnect to pinned Wi-Fi; retrying.\(detail)")
 }
 
 private func connectWiFiWithNetworkSetup(interface: String, ssid: String) throws {
@@ -389,6 +406,20 @@ private func connectWiFiWithCoreWLAN(interface: String, ssid: String) throws {
     try coreInterface.associate(to: network, password: nil)
 }
 
+private func scanForWiFiNetwork(interface: String, ssid: String) -> Bool {
+    guard let coreInterface = CWWiFiClient.shared().interface(withName: interface) else {
+        return false
+    }
+
+    do {
+        try coreInterface.setPower(true)
+        let networks = try coreInterface.scanForNetworks(withName: ssid)
+        return !networks.isEmpty
+    } catch {
+        return false
+    }
+}
+
 private func waitForWiFiSSID(_ ssid: String, interface: String, timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     repeat {
@@ -403,6 +434,45 @@ private func waitForWiFiSSID(_ ssid: String, interface: String, timeout: TimeInt
 private func setWiFiPowerOn(interface: String) {
     _ = try? run("/usr/sbin/networksetup", ["-setairportpower", interface, "on"])
     try? CWWiFiClient.shared().interface(withName: interface)?.setPower(true)
+}
+
+private func resetWiFiRadio(interface: String) {
+    _ = try? run("/usr/sbin/networksetup", ["-setairportpower", interface, "off"])
+    Thread.sleep(forTimeInterval: 1)
+    setWiFiPowerOn(interface: interface)
+    Thread.sleep(forTimeInterval: 1)
+}
+
+private func preferredWiFiNetworks(interface: String) -> Set<String> {
+    guard let result = try? run("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", interface]),
+          result.status == 0 else {
+        return []
+    }
+
+    return Set(result.output
+        .split(separator: "\n")
+        .dropFirst()
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty })
+}
+
+private func shortWiFiFailureMessage(from failures: [String]) -> String {
+    guard let lastFailure = failures.last?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !lastFailure.isEmpty else {
+        return ""
+    }
+
+    let lowercased = lastFailure.lowercased()
+    if lowercased.contains("password") {
+        return " Check the saved password."
+    }
+    if lowercased.contains("not be found") || lowercased.contains("could not find") {
+        return " Network was not found."
+    }
+    if lowercased.contains("association") || lowercased.contains("associate") {
+        return " Association failed."
+    }
+    return ""
 }
 
 public func removePreferredWiFi(ssid: String) throws {

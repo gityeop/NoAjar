@@ -1193,7 +1193,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             )
             item.target = self
             item.representedObject = ModeDurationChoice(mode: mode, duration: option.seconds)
-            item.isEnabled = activeMode != mode
             item.keyEquivalentModifierMask = mode == .awake ? [] : [.option]
             submenu.addItem(item)
         }
