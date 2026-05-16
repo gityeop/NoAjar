@@ -85,8 +85,9 @@ Settings includes:
 - Hotkey: opens the NoAjar menu. The default is Cmd-Opt-L and can be changed.
   Use Set Hotkey to record a shortcut by pressing the keys directly.
 - Launch at Login.
-- Check for Updates: checks the latest GitHub Release and opens the download page when a newer version is available.
-- Automatically Check for Updates: checks once per day in the background. NoAjar does not install updates silently.
+- Check for Updates: opens Sparkle's update checker.
+- Automatically Check for Updates: lets Sparkle check the appcast once per day.
+- Automatically Install Updates: lets Sparkle download and install updates in the background when possible.
 - Version: shows the installed app version and build.
 
 Hotkey menu navigation:
@@ -132,6 +133,22 @@ make notarize
 This uses the `FlowClip-Notary` notarytool keychain profile by default. Override
 it with `NOTARY_PROFILE=...` if needed. Notarization is required for Gatekeeper
 to fully accept a Developer ID build distributed outside your own Mac.
+
+Generate a notarized Sparkle update archive and appcast:
+
+```sh
+make appcast RELEASE_NOTES_FILE=/tmp/noajar-release.md
+```
+
+Sparkle updates use:
+
+- `SUFeedURL`: `https://github.com/gityeop/NoAjar/releases/latest/download/appcast.xml`
+- `SUPublicEDKey`: stored in `Resources/LidAwakeApp/Info.plist`
+- private EdDSA key file: `~/.config/noajar/sparkle_ed25519_private_key`
+
+Upload both `build/NoAjar.zip` and `build/appcast.xml` to the GitHub Release.
+The first Sparkle-enabled version must still be installed manually; later
+versions can update through Sparkle.
 
 The app bundle is created at:
 

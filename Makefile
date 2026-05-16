@@ -1,8 +1,15 @@
-.PHONY: build app notarize install uninstall uninstall-helper status clean
+.PHONY: build app notarize appcast install uninstall uninstall-helper status clean
 
 PREFIX ?= /usr/local
 APP_BUNDLE ?= build/NoAjar.app
 APP_ARCHIVE ?= build/NoAjar.zip
+APPCAST_FILE ?= build/appcast.xml
+SPARKLE_ARCHIVES_DIR ?= build/sparkle
+SPARKLE_PRIVATE_KEY_FILE = $(HOME)/.config/noajar/sparkle_ed25519_private_key
+SPARKLE_BIN_DIR ?= .build/artifacts/sparkle/Sparkle/bin
+SPARKLE_GENERATE_APPCAST ?= $(SPARKLE_BIN_DIR)/generate_appcast
+VERSION ?= $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/LidAwakeApp/Info.plist)
+UPDATE_DOWNLOAD_PREFIX ?= https://github.com/gityeop/NoAjar/releases/download/v$(VERSION)/
 NOTARY_PROFILE ?= FlowClip-Notary
 SIGN_IDENTITY ?= $(shell /usr/bin/security find-identity -v -p codesigning 2>/dev/null | /usr/bin/awk -F\" '/Developer ID Application:/ { print $$2; exit }')
 SIGN_IDENTITY := $(if $(strip $(SIGN_IDENTITY)),$(SIGN_IDENTITY),-)
@@ -18,6 +25,7 @@ app:
 	rm -rf "$(APP_BUNDLE)"
 	install -d "$(APP_BUNDLE)/Contents/MacOS"
 	install -d "$(APP_BUNDLE)/Contents/Resources"
+	install -d "$(APP_BUNDLE)/Contents/Frameworks"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchServices"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchDaemons"
 	install -m 0755 .build/release/LidAwakeMenuBar "$(APP_BUNDLE)/Contents/MacOS/NoAjar"
@@ -25,7 +33,10 @@ app:
 	install -m 0644 Resources/NoAjarHelper/dev.local.noajar.helper.plist "$(APP_BUNDLE)/Contents/Library/LaunchDaemons/dev.local.noajar.helper.plist"
 	install -m 0644 Resources/LidAwakeApp/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	install -m 0644 Resources/LidAwakeApp/NoAjar.icns "$(APP_BUNDLE)/Contents/Resources/NoAjar.icns"
+	SPARKLE_FRAMEWORK="$$(swift build -c release --show-bin-path)/Sparkle.framework"; test -d "$$SPARKLE_FRAMEWORK"; ditto "$$SPARKLE_FRAMEWORK" "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
+	install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP_BUNDLE)/Contents/MacOS/NoAjar" 2>/dev/null || true
 	codesign $(CODESIGN_FLAGS) --identifier dev.local.noajar.helper "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
+	codesign $(CODESIGN_FLAGS) --deep "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
 	codesign $(CODESIGN_FLAGS) --deep "$(APP_BUNDLE)"
 
 notarize:
@@ -39,6 +50,16 @@ notarize:
 	spctl -a -vvv --type execute "$(APP_BUNDLE)"
 	rm -f "$(APP_ARCHIVE)"
 	ditto -c -k --keepParent "$(APP_BUNDLE)" "$(APP_ARCHIVE)"
+
+appcast: notarize
+	@test -x "$(SPARKLE_GENERATE_APPCAST)" || (echo "Sparkle generate_appcast not found. Run swift package resolve first." >&2; exit 2)
+	@test -f "$(SPARKLE_PRIVATE_KEY_FILE)" || (echo "Sparkle private key not found at $(SPARKLE_PRIVATE_KEY_FILE)." >&2; exit 2)
+	rm -rf "$(SPARKLE_ARCHIVES_DIR)"
+	install -d "$(SPARKLE_ARCHIVES_DIR)"
+	install -m 0644 "$(APP_ARCHIVE)" "$(SPARKLE_ARCHIVES_DIR)/NoAjar.zip"
+	if [ -n "$(RELEASE_NOTES_FILE)" ]; then install -m 0644 "$(RELEASE_NOTES_FILE)" "$(SPARKLE_ARCHIVES_DIR)/NoAjar.md"; fi
+	"$(SPARKLE_GENERATE_APPCAST)" --ed-key-file "$(SPARKLE_PRIVATE_KEY_FILE)" --download-url-prefix "$(UPDATE_DOWNLOAD_PREFIX)" --embed-release-notes --maximum-versions 1 "$(SPARKLE_ARCHIVES_DIR)"
+	install -m 0644 "$(SPARKLE_ARCHIVES_DIR)/appcast.xml" "$(APPCAST_FILE)"
 
 install: build
 	install -d "$(PREFIX)/bin"

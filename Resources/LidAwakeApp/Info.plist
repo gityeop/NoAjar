@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3.2</string>
+	<string>0.3.3</string>
 	<key>CFBundleVersion</key>
-	<string>5</string>
+	<string>6</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -30,9 +30,17 @@
 	<string>NoAjar uses location permission only to read the current Wi-Fi network name for Wi-Fi Guard.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>NoAjar uses location permission only to read the current Wi-Fi network name for Wi-Fi Guard.</string>
-	<key>NoAjarUpdateCheckURL</key>
-	<string>https://api.github.com/repos/gityeop/NoAjar/releases/latest</string>
-	<key>NoAjarUpdateDownloadURL</key>
-	<string>https://github.com/gityeop/NoAjar/releases/latest</string>
+	<key>SUAllowsAutomaticUpdates</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/gityeop/NoAjar/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>yOGtGpiVZAuzoI2Z/mkcUnLWkVt0R6CbJCkekwJV34Y=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>

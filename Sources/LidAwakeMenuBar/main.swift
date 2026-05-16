@@ -7,6 +7,7 @@ import IOKit
 import IOKit.hid
 import LidAwakeCore
 import Security
+import Sparkle
 import UniformTypeIdentifiers
 
 private enum SessionSource {
@@ -798,111 +799,6 @@ private final class ModeDurationChoice: NSObject {
     }
 }
 
-private struct GitHubRelease: Decodable, Sendable {
-    let tagName: String
-    let name: String?
-    let htmlURL: String?
-    let draft: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case tagName = "tag_name"
-        case htmlURL = "html_url"
-        case name
-        case draft
-    }
-}
-
-private struct UpdateRelease: Sendable {
-    let version: String
-    let title: String
-    let downloadURL: URL
-}
-
-private enum UpdateCheckResult: Sendable {
-    case updateAvailable(UpdateRelease)
-    case upToDate(latestVersion: String)
-    case failed(String)
-}
-
-private enum NoAjarUpdateChecker {
-    static func check(
-        feedURL: URL,
-        fallbackDownloadURL: URL?,
-        currentVersion: String
-    ) async -> UpdateCheckResult {
-        var request = URLRequest(url: feedURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("NoAjar", forHTTPHeaderField: "User-Agent")
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                return .failed("The update server returned an invalid response.")
-            }
-            guard (200..<300).contains(httpResponse.statusCode) else {
-                if httpResponse.statusCode == 404 {
-                    return .failed("The configured update feed was not found.")
-                }
-                return .failed("The update server returned HTTP \(httpResponse.statusCode).")
-            }
-
-            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
-            guard release.draft != true else {
-                return .failed("The latest release is still marked as a draft.")
-            }
-
-            let latestVersion = normalizedVersion(release.tagName)
-            guard !latestVersion.isEmpty else {
-                return .failed("The latest release has an invalid version tag.")
-            }
-
-            guard isVersion(latestVersion, newerThan: currentVersion) else {
-                return .upToDate(latestVersion: latestVersion)
-            }
-
-            guard let downloadURL = release.htmlURL.flatMap(URL.init(string:)) ?? fallbackDownloadURL else {
-                return .failed("No download page is configured for the update.")
-            }
-
-            return .updateAvailable(UpdateRelease(
-                version: latestVersion,
-                title: release.name ?? "NoAjar \(latestVersion)",
-                downloadURL: downloadURL
-            ))
-        } catch {
-            return .failed(error.localizedDescription)
-        }
-    }
-
-    private static func normalizedVersion(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let withoutPrefix = trimmed.hasPrefix("v") || trimmed.hasPrefix("V") ? String(trimmed.dropFirst()) : trimmed
-        return String(withoutPrefix.prefix { character in
-            character.isNumber || character == "."
-        })
-    }
-
-    private static func isVersion(_ candidate: String, newerThan current: String) -> Bool {
-        let candidateParts = numericVersionParts(candidate)
-        let currentParts = numericVersionParts(current)
-        let count = max(candidateParts.count, currentParts.count)
-
-        for index in 0..<count {
-            let left = index < candidateParts.count ? candidateParts[index] : 0
-            let right = index < currentParts.count ? currentParts[index] : 0
-            if left > right { return true }
-            if left < right { return false }
-        }
-        return false
-    }
-
-    private static func numericVersionParts(_ version: String) -> [Int] {
-        normalizedVersion(version)
-            .split(separator: ".")
-            .map { Int($0) ?? 0 }
-    }
-}
-
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -935,9 +831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private var lastMessage: String?
     private var automationSuppressedUntil: Date?
     private var wifiGuardCheckInProgress = false
-    private var automaticUpdateChecksEnabled = true
-    private var updateCheckInProgress = false
-    private var scheduledUpdateCheck: DispatchWorkItem?
+    private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -945,6 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         locationManager.delegate = self
         repairStaleStateIfNeeded()
         loadPreferences()
+        setupSparkleUpdater()
         setupHotKey()
         monitorTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -957,13 +852,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             }
         }
         rebuildMenu()
-        scheduleAutomaticUpdateCheckIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         monitorTimer?.invalidate()
         lidBrightnessTimer?.invalidate()
-        scheduledUpdateCheck?.cancel()
         stopSession()
         lidBrightnessController.restoreIfNeeded()
     }
@@ -1006,7 +899,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         }
         minBatteryPercent = defaults.object(forKey: "minBatteryPercent") as? Int ?? 30
         batteryStopEnabled = defaults.object(forKey: "batteryGuardEnabled") as? Bool ?? true
-        automaticUpdateChecksEnabled = defaults.object(forKey: "automaticUpdateChecksEnabled") as? Bool ?? true
 
         if let rawMode = defaults.string(forKey: "autoAwakeMode"),
            let mode = AwakeMode(rawValue: rawMode) {
@@ -1032,7 +924,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         defaults.set(minBatteryPercent, forKey: "minBatteryPercent")
         defaults.set(autoAwakeMode.rawValue, forKey: "autoAwakeMode")
         defaults.set(watchedApps, forKey: "watchedApps")
-        defaults.set(automaticUpdateChecksEnabled, forKey: "automaticUpdateChecksEnabled")
     }
 
     private func rebuildMenu() {
@@ -1258,15 +1149,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         submenu.addItem(hotkeyMenuItem())
         submenu.addItem(toggleItem("Launch at Login", #selector(toggleLaunchAtLogin), state: launchAgent.isEnabled))
         submenu.addItem(.separator())
-        submenu.addItem(actionItem(
-            updateCheckInProgress ? "Checking for Updates..." : "Check for Updates...",
-            #selector(checkForUpdatesClicked),
-            enabled: !updateCheckInProgress
-        ))
+        submenu.addItem(actionItem("Check for Updates...", #selector(checkForUpdatesClicked), enabled: sparkleUpdater != nil))
         submenu.addItem(toggleItem(
             "Automatically Check for Updates",
             #selector(toggleAutomaticUpdateChecks),
-            state: automaticUpdateChecksEnabled
+            state: sparkleUpdater?.automaticallyChecksForUpdates ?? false,
+            enabled: sparkleUpdater != nil
+        ))
+        submenu.addItem(toggleItem(
+            "Automatically Install Updates",
+            #selector(toggleAutomaticInstallUpdates),
+            state: sparkleUpdater?.automaticallyDownloadsUpdates ?? false,
+            enabled: sparkleUpdater?.allowsAutomaticUpdates ?? false
         ))
         submenu.addItem(disabledItem("Version: \(appVersionDisplay())"))
 
@@ -1580,18 +1474,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     }
 
     @objc private func checkForUpdatesClicked() {
-        checkForUpdates(userInitiated: true)
+        sparkleUpdaterController?.checkForUpdates(nil)
     }
 
     @objc private func toggleAutomaticUpdateChecks() {
-        automaticUpdateChecksEnabled.toggle()
-        savePreferences()
-        if automaticUpdateChecksEnabled {
-            scheduleAutomaticUpdateCheckIfNeeded(ignoreLastCheck: true)
-        } else {
-            scheduledUpdateCheck?.cancel()
-            scheduledUpdateCheck = nil
-        }
+        guard let sparkleUpdater else { return }
+        sparkleUpdater.automaticallyChecksForUpdates.toggle()
+        rebuildMenu()
+    }
+
+    @objc private func toggleAutomaticInstallUpdates() {
+        guard let sparkleUpdater, sparkleUpdater.allowsAutomaticUpdates else { return }
+        sparkleUpdater.automaticallyDownloadsUpdates.toggle()
         rebuildMenu()
     }
 
@@ -1616,6 +1510,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             savePreferences()
             showError(error.localizedDescription)
         }
+    }
+
+    private func setupSparkleUpdater() {
+        sparkleUpdaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+    }
+
+    private var sparkleUpdater: SPUUpdater? {
+        sparkleUpdaterController?.updater
     }
 
     private func toggleFromHotKey() {
@@ -1827,91 +1733,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         }
     }
 
-    private func scheduleAutomaticUpdateCheckIfNeeded(ignoreLastCheck: Bool = false) {
-        scheduledUpdateCheck?.cancel()
-        scheduledUpdateCheck = nil
-
-        guard automaticUpdateChecksEnabled, !updateCheckInProgress else { return }
-
-        let lastCheck = UserDefaults.standard.object(forKey: "lastUpdateCheckAt") as? Date
-        if !ignoreLastCheck,
-           let lastCheck,
-           Date().timeIntervalSince(lastCheck) < 24 * 60 * 60 {
-            return
-        }
-
-        let workItem = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                self?.scheduledUpdateCheck = nil
-                self?.checkForUpdates(userInitiated: false)
-            }
-        }
-        scheduledUpdateCheck = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: workItem)
-    }
-
-    private func checkForUpdates(userInitiated: Bool) {
-        guard !updateCheckInProgress else { return }
-
-        guard let feedURL = updateCheckURL else {
-            if userInitiated {
-                showError("No update feed URL is configured.")
-            }
-            return
-        }
-
-        updateCheckInProgress = true
-        if userInitiated {
-            rebuildMenu()
-        }
-
-        let currentVersion = currentAppVersion()
-        let fallbackDownloadURL = updateDownloadURL
-
-        Task { [weak self] in
-            let result = await NoAjarUpdateChecker.check(
-                feedURL: feedURL,
-                fallbackDownloadURL: fallbackDownloadURL,
-                currentVersion: currentVersion
-            )
-            self?.finishUpdateCheck(result, userInitiated: userInitiated)
-        }
-    }
-
-    private func finishUpdateCheck(_ result: UpdateCheckResult, userInitiated: Bool) {
-        updateCheckInProgress = false
-        UserDefaults.standard.set(Date(), forKey: "lastUpdateCheckAt")
-        rebuildMenu()
-
-        switch result {
-        case .updateAvailable(let release):
-            showUpdateAvailableAlert(release)
-        case .upToDate(let latestVersion):
-            if userInitiated {
-                showInfo("NoAjar is up to date.", message: "Installed: \(appVersionDisplay())\nLatest: \(latestVersion)")
-            }
-        case .failed(let message):
-            if userInitiated {
-                showError("Update check failed: \(message)")
-            }
-        }
-    }
-
-    private var updateCheckURL: URL? {
-        bundleURL(forInfoKey: "NoAjarUpdateCheckURL")
-    }
-
-    private var updateDownloadURL: URL? {
-        bundleURL(forInfoKey: "NoAjarUpdateDownloadURL") ?? bundleURL(forInfoKey: "NoAjarReleasesURL")
-    }
-
-    private func bundleURL(forInfoKey key: String) -> URL? {
-        guard let rawValue = Bundle.main.object(forInfoDictionaryKey: key) as? String else {
-            return nil
-        }
-        return URL(string: rawValue)
-    }
-
     private func currentAppVersion() -> String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
     }
@@ -1923,27 +1744,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             return version
         }
         return "\(version) (\(build))"
-    }
-
-    private func showUpdateAvailableAlert(_ release: UpdateRelease) {
-        let alert = NSAlert()
-        alert.messageText = "NoAjar \(release.version) is available."
-        alert.informativeText = "Installed: \(appVersionDisplay())\nLatest: \(release.title)"
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open Download Page")
-        alert.addButton(withTitle: "Later")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(release.downloadURL)
-        }
-    }
-
-    private func showInfo(_ title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
     }
 
     private func showError(_ message: String) {

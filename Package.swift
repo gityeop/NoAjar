@@ -12,6 +12,9 @@ let package = Package(
         .executable(name: "LidAwakeMenuBar", targets: ["LidAwakeMenuBar"]),
         .executable(name: "NoAjarHelper", targets: ["NoAjarHelper"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.9.1")
+    ],
     targets: [
         .target(
             name: "LidAwakeCore"
@@ -22,7 +25,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "LidAwakeMenuBar",
-            dependencies: ["LidAwakeCore"]
+            dependencies: [
+                "LidAwakeCore",
+                .product(name: "Sparkle", package: "Sparkle")
+            ]
         ),
         .executableTarget(
             name: "NoAjarHelper",
