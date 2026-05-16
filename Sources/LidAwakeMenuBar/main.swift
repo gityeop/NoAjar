@@ -1,6 +1,5 @@
 import AppKit
 import Carbon
-import CoreLocation
 import Darwin
 import Foundation
 import IOKit
@@ -800,11 +799,10 @@ private final class ModeDurationChoice: NSObject {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let launchAgent = LaunchAgent(label: "dev.local.noajar")
-    private let locationManager = CLLocationManager()
     private let privilegedHelper = PrivilegedNoAjarHelperClient()
     private let lidBrightnessController = LidBrightnessController()
 
@@ -819,9 +817,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
 
     private var minBatteryPercent = 30
     private var batteryStopEnabled = true
-    private var wifiGuardEnabled = false
-    private var pinnedWiFi = ""
-    private var blockedWiFi: [String] = []
     private var autoWatchedApps = false
     private var autoAwakeMode = AwakeMode.awake
     private var hotKeyEnabled = true
@@ -830,13 +825,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private var lastAutomationReasons: [String] = []
     private var lastMessage: String?
     private var automationSuppressedUntil: Date?
-    private var wifiGuardCheckInProgress = false
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem.button?.title = "NoAjar"
-        locationManager.delegate = self
         repairStaleStateIfNeeded()
         loadPreferences()
         setupSparkleUpdater()
@@ -861,36 +854,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         lidBrightnessController.restoreIfNeeded()
     }
 
-    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        Task { @MainActor in
-            self.locationManager.stopUpdatingLocation()
-            self.clearResolvedWiFiPermissionMessage()
-            if self.isLocationAuthorizedForWiFiName {
-                self.lastMessage = "Wi-Fi name access is allowed."
-            }
-            self.rebuildMenu()
-        }
-    }
-
-    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        Task { @MainActor in
-            self.locationManager.stopUpdatingLocation()
-        }
-    }
-
-    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        Task { @MainActor in
-            self.locationManager.stopUpdatingLocation()
-            self.clearResolvedWiFiPermissionMessage()
-            self.rebuildMenu()
-        }
-    }
-
     private func loadPreferences() {
         let defaults = UserDefaults.standard
-        wifiGuardEnabled = defaults.bool(forKey: "wifiGuardEnabled")
-        pinnedWiFi = defaults.string(forKey: "pinnedWiFi") ?? ""
-        blockedWiFi = defaults.stringArray(forKey: "blockedWiFi") ?? []
         autoWatchedApps = defaults.bool(forKey: "autoWatchedApps")
         hotKeyEnabled = defaults.object(forKey: "hotKeyEnabled") as? Bool ?? true
         if let storedShortcut = defaults.string(forKey: "hotKeyShortcut"),
@@ -914,9 +879,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         defaults.set(true, forKey: "allowBattery")
         defaults.set(batteryStopEnabled, forKey: "batteryGuardEnabled")
         defaults.set(false, forKey: "preventDisplaySleep")
-        defaults.set(wifiGuardEnabled, forKey: "wifiGuardEnabled")
-        defaults.set(pinnedWiFi, forKey: "pinnedWiFi")
-        defaults.set(blockedWiFi, forKey: "blockedWiFi")
         defaults.set(autoWatchedApps, forKey: "autoWatchedApps")
         defaults.set(false, forKey: "powerProtectEnabled")
         defaults.set(hotKeyEnabled, forKey: "hotKeyEnabled")
@@ -932,7 +894,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
 
         let active = session != nil
         statusItem.button?.title = menuBarStatusTitle()
-        clearResolvedWiFiPermissionMessage()
 
         menu.addItem(statusHeaderMenuItem())
         menu.addItem(.separator())
@@ -941,7 +902,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         addItem("Turn Off", #selector(turnOffClicked), keyEquivalent: "0", keyEquivalentModifierMask: [], enabled: active)
 
         menu.addItem(.separator())
-        menu.addItem(wifiMenuItem())
         menu.addItem(appsMenuItem())
         menu.addItem(preferencesMenuItem())
 
@@ -1006,31 +966,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
                 .systemOrange
             ))
         }
-        rows.append(("Wi-Fi: \(wifiStatusLabel())", .systemFont(ofSize: 13, weight: .regular), .labelColor))
         return rows
-    }
-
-    private func clearResolvedWiFiPermissionMessage() {
-        guard let lastMessage, isWiFiPermissionMessage(lastMessage) else { return }
-
-        if isLocationAuthorizedForWiFiName || wifiStatus().currentSSID != nil {
-            self.lastMessage = nil
-        }
-    }
-
-    private var isLocationAuthorizedForWiFiName: Bool {
-        switch locationManager.authorizationStatus {
-        case .authorizedAlways, .authorizedWhenInUse, .authorized:
-            return true
-        case .notDetermined, .denied, .restricted:
-            return false
-        @unknown default:
-            return false
-        }
-    }
-
-    private func isWiFiPermissionMessage(_ message: String) -> Bool {
-        message.contains("Location access") || message.contains("Wi-Fi name access")
     }
 
     private func menuBarStatusTitle() -> String {
@@ -1091,39 +1027,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         submenu.addItem(batteryThresholdMenuItem())
         parent.submenu = submenu
         return parent
-    }
-
-    private func wifiMenuItem() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Wi-Fi", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        submenu.autoenablesItems = false
-
-        submenu.addItem(toggleItem("Wi-Fi Guard", #selector(toggleWiFiGuard), state: wifiGuardEnabled))
-        if let accessItem = wifiNameAccessMenuItem() {
-            submenu.addItem(accessItem)
-        }
-        submenu.addItem(actionItem("Pin Current Wi-Fi", #selector(pinCurrentWiFi)))
-        submenu.addItem(actionItem("Input Pinned Network...", #selector(editPinnedWiFi)))
-        submenu.addItem(disabledItem("Pinned: \(pinnedWiFi.isEmpty ? "None" : pinnedWiFi)"))
-        submenu.addItem(actionItem("Block Current Wi-Fi", #selector(blockCurrentWiFi)))
-        submenu.addItem(actionItem("Input Blocked Networks...", #selector(editBlockedWiFi)))
-        submenu.addItem(disabledItem("Blocked: \(blockedWiFi.isEmpty ? "None" : blockedWiFi.joined(separator: ", "))"))
-
-        parent.submenu = submenu
-        return parent
-    }
-
-    private func wifiNameAccessMenuItem() -> NSMenuItem? {
-        switch locationManager.authorizationStatus {
-        case .authorizedAlways, .authorizedWhenInUse, .authorized:
-            return nil
-        case .notDetermined:
-            return actionItem("Allow Wi-Fi Name Access", #selector(requestWiFiNameAccess))
-        case .denied, .restricted:
-            return actionItem("Open Wi-Fi Name Access Settings", #selector(requestWiFiNameAccess))
-        @unknown default:
-            return actionItem("Allow Wi-Fi Name Access", #selector(requestWiFiNameAccess))
-        }
     }
 
     private func appsMenuItem() -> NSMenuItem {
@@ -1286,82 +1189,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
             lastMessage = "Battery setting applies to the next session."
         }
         savePreferences()
-        rebuildMenu()
-    }
-
-    @objc private func toggleWiFiGuard() {
-        if !wifiGuardEnabled {
-            let status = wifiStatus()
-            if status.linkActive, status.currentSSID == nil {
-                requestLocationPermissionForWiFiName()
-            }
-        }
-        wifiGuardEnabled.toggle()
-        savePreferences()
-        checkWiFiGuard()
-        rebuildMenu()
-    }
-
-    @objc private func pinCurrentWiFi() {
-        let status = wifiStatus()
-        guard let ssid = status.currentSSID else {
-            showWiFiNameUnavailableMessage(status: status)
-            return
-        }
-
-        pinnedWiFi = ssid
-        savePreferences()
-        lastMessage = "Pinned Wi-Fi: \(ssid)"
-        rebuildMenu()
-    }
-
-    @objc private func editPinnedWiFi() {
-        let value = promptText(
-            title: "Pinned Wi-Fi",
-            message: "Enter the Wi-Fi name NoAjar should return to during an active session.",
-            value: pinnedWiFi
-        )
-        guard let value else { return }
-        pinnedWiFi = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        savePreferences()
-        rebuildMenu()
-    }
-
-    @objc private func blockCurrentWiFi() {
-        let status = wifiStatus()
-        guard let ssid = status.currentSSID else {
-            showWiFiNameUnavailableMessage(status: status)
-            return
-        }
-
-        if !blockedWiFi.contains(ssid) {
-            blockedWiFi.append(ssid)
-            blockedWiFi.sort()
-        }
-        savePreferences()
-        checkWiFiGuard(force: true)
-        rebuildMenu()
-    }
-
-    @objc private func requestWiFiNameAccess() {
-        requestLocationPermissionForWiFiName()
-        rebuildMenu()
-    }
-
-    @objc private func editBlockedWiFi() {
-        let value = promptText(
-            title: "Blocked Wi-Fi",
-            message: "Enter Wi-Fi names to avoid, separated by commas.",
-            value: blockedWiFi.joined(separator: ", ")
-        )
-        guard let value else { return }
-        blockedWiFi = value
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .sorted()
-        savePreferences()
-        checkWiFiGuard(force: true)
         rebuildMenu()
     }
 
@@ -1615,7 +1442,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
     private func monitorTick() {
         syncLidBrightness()
         checkSafety()
-        checkWiFiGuard()
         evaluateAutomation()
         rebuildMenu()
     }
@@ -1669,70 +1495,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         return ["App Auto Awake"]
     }
 
-    private func checkWiFiGuard(force: Bool = false) {
-        guard wifiGuardEnabled, session != nil || force else { return }
-
-        let cleanPinnedWiFi = pinnedWiFi.trimmingCharacters(in: .whitespacesAndNewlines)
-        let blocked = Set(blockedWiFi.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
-
-        if !cleanPinnedWiFi.isEmpty, blocked.contains(cleanPinnedWiFi) {
-            lastMessage = "Wi-Fi Guard paused: pinned Wi-Fi is also blocked."
-            return
-        }
-
-        let status = wifiStatus()
-        guard status.interface != nil else {
-            lastMessage = "Wi-Fi Guard: no Wi-Fi interface found."
-            return
-        }
-        if status.currentSSID == nil, status.linkActive {
-            lastMessage = "Wi-Fi Guard needs Location access to read this network name."
-            return
-        }
-
-        guard !wifiGuardCheckInProgress else { return }
-
-        let currentSSID = status.currentSSID
-        guard force || !blocked.isEmpty || (!cleanPinnedWiFi.isEmpty && currentSSID != cleanPinnedWiFi) else {
-            return
-        }
-
-        wifiGuardCheckInProgress = true
-        Task.detached(priority: .utility) { [cleanPinnedWiFi, blocked, currentSSID] in
-            let message: String?
-            do {
-                for ssid in blocked {
-                    try removePreferredWiFi(ssid: ssid)
-                }
-
-                if let currentSSID, blocked.contains(currentSSID) {
-                    if !cleanPinnedWiFi.isEmpty {
-                        try connectWiFi(ssid: cleanPinnedWiFi)
-                        message = "Wi-Fi Guard moved from \(currentSSID) to \(cleanPinnedWiFi)."
-                    } else {
-                        try disconnectCurrentWiFi()
-                        message = "Wi-Fi Guard disconnected blocked Wi-Fi: \(currentSSID)."
-                    }
-                } else if !cleanPinnedWiFi.isEmpty, currentSSID != cleanPinnedWiFi {
-                    try connectWiFi(ssid: cleanPinnedWiFi)
-                    message = "Wi-Fi Guard reconnected to \(cleanPinnedWiFi)."
-                } else {
-                    message = nil
-                }
-            } catch {
-                message = "Wi-Fi Guard: \(error.localizedDescription)"
-            }
-
-            await MainActor.run { [weak self] in
-                self?.wifiGuardCheckInProgress = false
-                if let message {
-                    self?.lastMessage = message
-                }
-                self?.rebuildMenu()
-            }
-        }
-    }
-
     private func currentAppVersion() -> String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
     }
@@ -1752,39 +1514,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.runModal()
-    }
-
-    private func showWiFiNameUnavailableMessage(status: WiFiStatus) {
-        if status.linkActive {
-            requestLocationPermissionForWiFiName()
-            showError("macOS is hiding the current Wi-Fi name. Allow Location access for NoAjar, then try again.")
-        } else {
-            showError("No Wi-Fi network is currently connected.")
-        }
-    }
-
-    private func requestLocationPermissionForWiFiName() {
-        switch locationManager.authorizationStatus {
-        case .notDetermined:
-            NSApp.activate(ignoringOtherApps: true)
-            locationManager.requestWhenInUseAuthorization()
-            locationManager.startUpdatingLocation()
-            lastMessage = "Allow Location access in the macOS prompt."
-        case .authorizedAlways, .authorizedWhenInUse, .authorized:
-            locationManager.stopUpdatingLocation()
-            lastMessage = "Wi-Fi name access is already allowed."
-        case .denied, .restricted:
-            locationManager.stopUpdatingLocation()
-            openPermissionAlert(
-                title: "Location Access Needed",
-                message: "NoAjar needs Location permission to read Wi-Fi names. This is required by macOS for Wi-Fi Guard."
-            )
-        @unknown default:
-            NSApp.activate(ignoringOtherApps: true)
-            locationManager.requestWhenInUseAuthorization()
-            locationManager.startUpdatingLocation()
-            lastMessage = "Allow Location access in the macOS prompt."
-        }
     }
 
     private func authorizeNoAjarMode() -> Bool {
@@ -1807,54 +1536,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDeleg
         }
     }
 
-    private func openPermissionAlert(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Open Settings")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            openPrivacySettings()
-        }
-    }
-
-    private func openPrivacySettings() {
-        let urls = [
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
-        ]
-        for rawURL in urls {
-            guard let url = URL(string: rawURL), NSWorkspace.shared.open(url) else { continue }
-            return
-        }
-    }
-
-    private func wifiStatusLabel() -> String {
-        let status = wifiStatus()
-        if let ssid = status.currentSSID {
-            return ssid
-        }
-        if status.linkActive {
-            return "Name unavailable"
-        }
-        return "Not connected"
-    }
-
-    private func promptText(title: String, message: String, value: String) -> String? {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-
-        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        textField.stringValue = value
-        alert.accessoryView = textField
-
-        return alert.runModal() == .alertFirstButtonReturn ? textField.stringValue : nil
-    }
 }
 
 private let durationOptions: [(title: String, seconds: TimeInterval?)] = [

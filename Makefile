@@ -14,7 +14,8 @@ NOTARY_PROFILE ?= FlowClip-Notary
 SIGN_IDENTITY ?= $(shell /usr/bin/security find-identity -v -p codesigning 2>/dev/null | /usr/bin/awk -F\" '/Developer ID Application:/ { print $$2; exit }')
 SIGN_IDENTITY := $(if $(strip $(SIGN_IDENTITY)),$(SIGN_IDENTITY),-)
 TIMESTAMP_FLAG := $(if $(filter -,$(SIGN_IDENTITY)),,--timestamp)
-CODESIGN_FLAGS := --force --options runtime $(TIMESTAMP_FLAG) --sign "$(SIGN_IDENTITY)"
+RUNTIME_FLAG := $(if $(filter -,$(SIGN_IDENTITY)),,--options runtime)
+CODESIGN_FLAGS := --force $(RUNTIME_FLAG) $(TIMESTAMP_FLAG) --sign "$(SIGN_IDENTITY)"
 
 build:
 	swift build -c release

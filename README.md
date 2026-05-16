@@ -23,7 +23,6 @@ The menu bar app keeps the main menu intentionally small:
 Awake Mode
 No Ajar Mode
 Turn Off
-Wi-Fi
 Apps
 Settings
 Quit
@@ -46,19 +45,6 @@ Awake Mode and No Ajar Mode each include:
 - Start 8 Hours.
 - Stop Below: select the battery percentage where NoAjar automatically ends the session.
 - Keep Running: keep the session active without battery-percentage auto stop.
-
-Wi-Fi includes:
-
-- Wi-Fi Guard: during an active session, return to a pinned Wi-Fi network if
-  macOS switches networks or disconnects.
-- Pin Current Wi-Fi: save the currently connected network as the preferred network.
-- Input Pinned Network: type the network name manually.
-- Block Current Wi-Fi: add the currently connected network to the blocked list.
-- Input Blocked Networks: type blocked network names manually.
-- Blocked Wi-Fi: remove blocked SSIDs from the preferred network list and
-  disconnect from them during an active session.
-- Allow Wi-Fi Name Access: request Location permission needed for Personal Hotspot SSID detection.
-  This item is hidden once permission is already granted.
 
 Apps includes:
 
@@ -96,15 +82,6 @@ Hotkey menu navigation:
 - Press Cmd-1 for Awake Mode or Cmd-2 for No Ajar Mode.
 - Press 1, 2, 3, 4, or 5 to start Until Stopped, 30 Minutes, 1 Hour, 4 Hours,
   or 8 Hours.
-
-Wi-Fi Guard uses macOS `networksetup`. It can reconnect to saved networks, but
-it cannot connect to a network whose password is not already available to macOS.
-Blocked Wi-Fi is best understood as "avoid and remove from preferred networks",
-not a kernel-level network ban.
-
-macOS may hide the current Wi-Fi name, especially for Personal Hotspot, unless
-NoAjar has Location permission. If permission has not been granted yet, use
-`Wi-Fi > Allow Wi-Fi Name Access`, then try `Pin Current Wi-Fi` again.
 
 ## Build
 
