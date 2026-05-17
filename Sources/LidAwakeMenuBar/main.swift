@@ -821,7 +821,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoAwakeMode = AwakeMode.awake
     private var hotKeyEnabled = true
     private var hotKeyShortcut = HotKeyShortcut.defaultShortcut
-    private var watchedApps = ["remodex", "opencode", "openclaw", "claude", "codex"]
+    private var watchedApps: [String] = []
     private var lastAutomationReasons: [String] = []
     private var lastMessage: String?
     private var automationSuppressedUntil: Date?
@@ -869,7 +869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            let mode = AwakeMode(rawValue: rawMode) {
             autoAwakeMode = mode
         }
-        if let storedApps = defaults.stringArray(forKey: "watchedApps"), !storedApps.isEmpty {
+        if let storedApps = defaults.stringArray(forKey: "watchedApps") {
             watchedApps = storedApps
         }
     }
