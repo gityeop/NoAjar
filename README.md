@@ -13,7 +13,7 @@ NoAjar has two user-facing modes:
 | Mode | What it does |
 | --- | --- |
 | Awake Mode | Keeps the Mac and display awake while the lid is open. This uses normal macOS sleep assertions and does not change lid-close behavior. |
-| No Ajar Mode | Keeps the Mac awake even when the lid is fully closed. This enables `pmset disablesleep 1` and prevents idle display sleep while the session is active. |
+| No Ajar Mode | Keeps the Mac awake even when the lid is fully closed. This enables `pmset disablesleep 1` while allowing the display to sleep by default. |
 
 The menu bar app keeps the main menu intentionally small:
 

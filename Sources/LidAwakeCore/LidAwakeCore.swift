@@ -37,7 +37,12 @@ public enum AwakeMode: String, CaseIterable, Codable {
     }
 
     public var preventsDisplaySleep: Bool {
-        true
+        switch self {
+        case .awake:
+            true
+        case .noAjar:
+            false
+        }
     }
 }
 
