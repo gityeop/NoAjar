@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Assets/noajar-icon.png" alt="NoAjar icon" width="128">
+</p>
+
 # NoAjar
 
 NoAjar is a small macOS menu bar app for keeping coding agents alive without
