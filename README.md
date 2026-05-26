@@ -1,8 +1,8 @@
-<p align="center">
-  <img src="Assets/noajar-icon.png" alt="NoAjar icon" width="128">
-</p>
+# NoAjar - Mac Sleep Control for Local Coding Agents
 
-# NoAjar
+<p align="center">
+  <img src="Assets/noajar-icon.png" alt="NoAjar icon" width="220">
+</p>
 
 NoAjar is a small macOS menu bar app for keeping coding agents alive without
 walking around with a MacBook slightly ajar.
