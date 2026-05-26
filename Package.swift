@@ -8,7 +8,7 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "lid-awake", targets: ["LidAwake"]),
+        .executable(name: "noajar", targets: ["LidAwake"]),
         .executable(name: "LidAwakeMenuBar", targets: ["LidAwakeMenuBar"]),
         .executable(name: "NoAjarHelper", targets: ["NoAjarHelper"])
     ],

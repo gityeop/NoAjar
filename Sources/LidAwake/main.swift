@@ -4,16 +4,16 @@ import LidAwakeCore
 private func printUsage() {
     print("""
     Usage:
-      lid-awake start [--awake|--no-ajar] [--allow-battery] [--no-battery-guard] [--min-battery PERCENT] [--duration 2h|30m|1800] [--display-awake]
-      lid-awake stop
-      lid-awake status
+      noajar start [--awake|--no-ajar] [--allow-battery] [--no-battery-guard] [--min-battery PERCENT] [--duration 2h|30m|1800] [--display-awake]
+      noajar stop
+      noajar status
 
     Examples:
-      lid-awake start --no-ajar --duration 8h
-      lid-awake start --awake --duration 1h
-      lid-awake start --duration 1h --display-awake
-      lid-awake start --allow-battery --min-battery 40
-      lid-awake stop
+      noajar start --no-ajar --duration 8h
+      noajar start --awake --duration 1h
+      noajar start --duration 1h --display-awake
+      noajar start --allow-battery --min-battery 40
+      noajar stop
     """)
 }
 
@@ -67,7 +67,7 @@ private func start(_ options: LidAwakeOptions) throws -> Never {
     }
 
     print("\(options.mode.displayName) is active.")
-    print("Sleep assertion active. Press Ctrl-C or run `lid-awake stop` to restore.")
+    print("Sleep assertion active. Press Ctrl-C or run `noajar stop` to restore.")
 
     while true {
         withExtendedLifetime(signalSources) {}

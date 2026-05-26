@@ -425,7 +425,7 @@ public func installSignalCleanup(_ cleanup: @escaping () -> Void) -> [DispatchSo
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
 
-    let signalQueue = DispatchQueue(label: "lid-awake.signals")
+    let signalQueue = DispatchQueue(label: "noajar.signals")
     let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
     let terminate = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
 
