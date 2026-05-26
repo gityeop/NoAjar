@@ -136,13 +136,13 @@ The app bundle includes the `noajar` CLI.
 Run it directly from the downloaded app:
 
 ```sh
-/Applications/NoAjar.app/Contents/MacOS/noajar status
+/Applications/NoAjar.app/Contents/Helpers/noajar status
 ```
 
 To make `noajar` available from any terminal:
 
 ```sh
-sudo ln -sf /Applications/NoAjar.app/Contents/MacOS/noajar /usr/local/bin/noajar
+sudo ln -sf /Applications/NoAjar.app/Contents/Helpers/noajar /usr/local/bin/noajar
 ```
 
 No Ajar Mode for eight hours:

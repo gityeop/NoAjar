@@ -135,13 +135,13 @@ make uninstall-helper
 다운로드한 앱에서 바로 실행할 수 있습니다.
 
 ```sh
-/Applications/NoAjar.app/Contents/MacOS/noajar status
+/Applications/NoAjar.app/Contents/Helpers/noajar status
 ```
 
 터미널 어디서든 `noajar`로 실행하려면 한 번만 심볼릭 링크를 만듭니다.
 
 ```sh
-sudo ln -sf /Applications/NoAjar.app/Contents/MacOS/noajar /usr/local/bin/noajar
+sudo ln -sf /Applications/NoAjar.app/Contents/Helpers/noajar /usr/local/bin/noajar
 ```
 
 No Ajar Mode를 8시간 동안 실행:

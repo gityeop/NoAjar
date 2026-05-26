@@ -27,11 +27,12 @@ app:
 	rm -rf "$(APP_BUNDLE)"
 	install -d "$(APP_BUNDLE)/Contents/MacOS"
 	install -d "$(APP_BUNDLE)/Contents/Resources"
+	install -d "$(APP_BUNDLE)/Contents/Helpers"
 	install -d "$(APP_BUNDLE)/Contents/Frameworks"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchServices"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchDaemons"
 	install -m 0755 .build/release/LidAwakeMenuBar "$(APP_BUNDLE)/Contents/MacOS/NoAjar"
-	install -m 0755 .build/release/noajar "$(APP_BUNDLE)/Contents/MacOS/noajar"
+	install -m 0755 .build/release/noajar "$(APP_BUNDLE)/Contents/Helpers/noajar"
 	install -m 0755 .build/release/NoAjarHelper "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
 	install -m 0644 Resources/NoAjarHelper/dev.local.noajar.helper.plist "$(APP_BUNDLE)/Contents/Library/LaunchDaemons/dev.local.noajar.helper.plist"
 	install -m 0644 Resources/LidAwakeApp/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
@@ -39,7 +40,7 @@ app:
 	SPARKLE_FRAMEWORK="$$(swift build -c release --show-bin-path)/Sparkle.framework"; test -d "$$SPARKLE_FRAMEWORK"; ditto "$$SPARKLE_FRAMEWORK" "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
 	install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP_BUNDLE)/Contents/MacOS/NoAjar" 2>/dev/null || true
 	codesign $(CODESIGN_FLAGS) --identifier dev.local.noajar.helper "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
-	codesign $(CODESIGN_FLAGS) "$(APP_BUNDLE)/Contents/MacOS/noajar"
+	codesign $(CODESIGN_FLAGS) "$(APP_BUNDLE)/Contents/Helpers/noajar"
 	codesign $(CODESIGN_FLAGS) --deep "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
 	codesign $(CODESIGN_FLAGS) --deep "$(APP_BUNDLE)"
 
