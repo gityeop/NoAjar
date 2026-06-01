@@ -14,6 +14,8 @@ private enum SessionSource {
     case automation
 }
 
+private let betaAppcastURLString = "https://github.com/gityeop/NoAjar/releases/download/beta/appcast-beta.xml"
+
 private struct HotKeyShortcut {
     let storageValue: String
     let displayName: String
@@ -788,18 +790,16 @@ private final class PrivilegedNoAjarHelperClient {
     }
 }
 
-private final class ModeDurationChoice: NSObject {
-    let mode: AwakeMode
+private final class DurationChoice: NSObject {
     let duration: TimeInterval?
 
-    init(mode: AwakeMode, duration: TimeInterval?) {
-        self.mode = mode
+    init(duration: TimeInterval?) {
         self.duration = duration
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpdaterDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let launchAgent = LaunchAgent(label: "dev.local.noajar")
@@ -809,6 +809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var session: LidAwakeSession?
     private var sessionSource: SessionSource?
     private var activeMode: AwakeMode?
+    private var activeDurationSeconds: TimeInterval?
     private var sessionEndsAt: Date?
     private var monitorTimer: Timer?
     private var lidBrightnessTimer: Timer?
@@ -821,9 +822,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoAwakeMode = AwakeMode.awake
     private var hotKeyEnabled = true
     private var hotKeyShortcut = HotKeyShortcut.defaultShortcut
+    private var betaUpdateCheckInProgress = false
     private var watchedApps: [String] = []
     private var lastAutomationReasons: [String] = []
     private var lastMessage: String?
+    private var isMenuOpen = false
+    private var lastHotKeyActivationAt: Date?
     private var automationSuppressedUntil: Date?
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
@@ -832,6 +836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "NoAjar"
         repairStaleStateIfNeeded()
         loadPreferences()
+        menu.delegate = self
         setupSparkleUpdater()
         setupHotKey()
         monitorTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -852,6 +857,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lidBrightnessTimer?.invalidate()
         stopSession()
         lidBrightnessController.restoreIfNeeded()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+        lastHotKeyActivationAt = Date()
     }
 
     private func loadPreferences() {
@@ -892,21 +906,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.removeAllItems()
         menu.autoenablesItems = false
 
-        let active = session != nil
         statusItem.button?.title = menuBarStatusTitle()
 
         menu.addItem(statusHeaderMenuItem())
         menu.addItem(.separator())
-        menu.addItem(modeMenuItem(.awake))
-        menu.addItem(modeMenuItem(.noAjar))
-        addItem("Turn Off", #selector(turnOffClicked), keyEquivalent: "0", keyEquivalentModifierMask: [], enabled: active)
+        menu.addItem(modeToggleMenuItem(.noAjar))
+        menu.addItem(modeToggleMenuItem(.awake))
+        menu.addItem(durationMenuItem())
 
         menu.addItem(.separator())
         menu.addItem(appsMenuItem())
         menu.addItem(preferencesMenuItem())
 
         menu.addItem(.separator())
-        addItem("Quit", #selector(quitClicked), keyEquivalent: "q", keyEquivalentModifierMask: [.command])
+        let quitItem = actionItem("Quit", #selector(quitClicked), keyEquivalent: "q", keyEquivalentModifierMask: [.command])
+        applyIcon("rectangle.portrait.and.arrow.right", to: quitItem)
+        menu.addItem(quitItem)
 
         statusItem.menu = menu
     }
@@ -1003,24 +1018,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "\(max(1, remaining / 60))m left"
     }
 
-    private func modeMenuItem(_ mode: AwakeMode) -> NSMenuItem {
-        let parent = NSMenuItem(
-            title: mode.displayName,
-            action: nil,
-            keyEquivalent: ""
+    private func modeToggleMenuItem(_ mode: AwakeMode) -> NSMenuItem {
+        let item = actionItem(
+            mode.displayName,
+            mode == .noAjar ? #selector(toggleNoAjarMode) : #selector(toggleAwakeMode)
         )
-        parent.state = activeMode == mode ? .on : .off
+        item.state = activeMode == mode ? .on : .off
+        applyIcon(mode == .noAjar ? "waveform.path.ecg" : "cup.and.saucer", to: item)
+        return item
+    }
+
+    private func durationMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Duration: \(durationLabel(activeDurationSeconds))", action: nil, keyEquivalent: "")
+        applyIcon("clock", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
-        for (index, option) in durationOptions.enumerated() {
+        for option in durationOptions {
             let item = NSMenuItem(
-                title: "Start \(option.title)",
-                action: #selector(startModeDuration(_:)),
-                keyEquivalent: "\(index + 1)"
+                title: option.title,
+                action: #selector(changeDuration(_:)),
+                keyEquivalent: ""
             )
             item.target = self
-            item.representedObject = ModeDurationChoice(mode: mode, duration: option.seconds)
-            item.keyEquivalentModifierMask = mode == .awake ? [] : [.option]
+            item.representedObject = DurationChoice(duration: option.seconds)
+            item.state = durationsMatch(activeDurationSeconds, option.seconds) ? .on : .off
             submenu.addItem(item)
         }
         submenu.addItem(.separator())
@@ -1031,12 +1052,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func appsMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Apps", action: nil, keyEquivalent: "")
+        applyIcon("square.grid.2x2", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
-        submenu.addItem(toggleItem("App Auto Awake", #selector(toggleAutoWatchedApps), state: autoWatchedApps))
-        submenu.addItem(actionItem("Add Apps...", #selector(editWatchedApps)))
-        submenu.addItem(actionItem("Clear Apps", #selector(clearWatchedApps), enabled: !watchedApps.isEmpty))
+        let autoAwake = toggleItem("App Auto Awake", #selector(toggleAutoWatchedApps), state: autoWatchedApps)
+        applyIcon("bolt", to: autoAwake)
+        submenu.addItem(autoAwake)
+        submenu.addItem(iconItem("Add Apps...", #selector(editWatchedApps), symbolName: "plus.app"))
+        submenu.addItem(iconItem("Clear Apps", #selector(clearWatchedApps), symbolName: "trash", enabled: !watchedApps.isEmpty))
         submenu.addItem(appAutoModeMenuItem())
         submenu.addItem(disabledItem("Apps: \(watchedApps.joined(separator: ", "))"))
 
@@ -1046,25 +1070,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func preferencesMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        applyIcon("gearshape", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
         submenu.addItem(hotkeyMenuItem())
-        submenu.addItem(toggleItem("Launch at Login", #selector(toggleLaunchAtLogin), state: launchAgent.isEnabled))
+        let launchAtLogin = toggleItem("Launch at Login", #selector(toggleLaunchAtLogin), state: launchAgent.isEnabled)
+        applyIcon("arrow.clockwise.circle", to: launchAtLogin)
+        submenu.addItem(launchAtLogin)
         submenu.addItem(.separator())
-        submenu.addItem(actionItem("Check for Updates...", #selector(checkForUpdatesClicked), enabled: sparkleUpdater != nil))
-        submenu.addItem(toggleItem(
+        submenu.addItem(iconItem("Check for Updates...", #selector(checkForUpdatesClicked), symbolName: "arrow.down.circle", enabled: sparkleUpdater != nil))
+        let updateChecks = toggleItem(
             "Automatically Check for Updates",
             #selector(toggleAutomaticUpdateChecks),
             state: sparkleUpdater?.automaticallyChecksForUpdates ?? false,
             enabled: sparkleUpdater != nil
-        ))
-        submenu.addItem(toggleItem(
+        )
+        applyIcon("arrow.triangle.2.circlepath", to: updateChecks)
+        submenu.addItem(updateChecks)
+        let installUpdates = toggleItem(
             "Automatically Install Updates",
             #selector(toggleAutomaticInstallUpdates),
             state: sparkleUpdater?.automaticallyDownloadsUpdates ?? false,
             enabled: sparkleUpdater?.allowsAutomaticUpdates ?? false
-        ))
+        )
+        applyIcon("arrow.down.app", to: installUpdates)
+        submenu.addItem(installUpdates)
+        let betaUpdates = iconItem(
+            betaUpdateCheckInProgress ? "Checking Beta Updates..." : "Try Beta Updates",
+            #selector(tryBetaUpdatesClicked),
+            symbolName: "sparkles",
+            enabled: sparkleUpdater != nil && !betaUpdateCheckInProgress
+        )
+        submenu.addItem(betaUpdates)
         submenu.addItem(disabledItem("Version: \(appVersionDisplay())"))
 
         parent.submenu = submenu
@@ -1073,11 +1111,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hotkeyMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Hotkey: \(hotKeyShortcut.displayName)", action: nil, keyEquivalent: "")
+        applyIcon("keyboard", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
-        submenu.addItem(toggleItem("Enabled", #selector(toggleHotKey), state: hotKeyEnabled))
-        submenu.addItem(actionItem("Set Hotkey...", #selector(setHotKeyShortcut)))
+        let enabled = toggleItem("Enabled", #selector(toggleHotKey), state: hotKeyEnabled)
+        applyIcon("checkmark.circle", to: enabled)
+        submenu.addItem(enabled)
+        submenu.addItem(iconItem("Set Hotkey...", #selector(setHotKeyShortcut), symbolName: "keyboard.badge.ellipsis"))
 
         parent.submenu = submenu
         return parent
@@ -1086,6 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func batteryThresholdMenuItem() -> NSMenuItem {
         let title = batteryStopEnabled ? "Stop Below \(minBatteryPercent)%" : "Stop Below: Keep Running"
         let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        applyIcon("battery.75percent", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         let keepRunningItem = NSMenuItem(title: "Keep Running", action: #selector(setBatteryThreshold(_:)), keyEquivalent: "")
@@ -1107,6 +1149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func appAutoModeMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Mode: \(autoAwakeMode.displayName)", action: nil, keyEquivalent: "")
+        applyIcon("slider.horizontal.3", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         for mode in AwakeMode.allCases {
@@ -1152,6 +1195,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
+    private func iconItem(
+        _ title: String,
+        _ action: Selector,
+        symbolName: String,
+        keyEquivalent: String = "",
+        keyEquivalentModifierMask: NSEvent.ModifierFlags? = nil,
+        enabled: Bool = true
+    ) -> NSMenuItem {
+        let item = actionItem(
+            title,
+            action,
+            keyEquivalent: keyEquivalent,
+            keyEquivalentModifierMask: keyEquivalentModifierMask,
+            enabled: enabled
+        )
+        applyIcon(symbolName, to: item)
+        return item
+    }
+
+    @discardableResult
+    private func applyIcon(_ symbolName: String, to item: NSMenuItem) -> NSMenuItem {
+        item.image = menuIcon(symbolName)
+        return item
+    }
+
+    private func menuIcon(_ symbolName: String) -> NSImage? {
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else {
+            return nil
+        }
+        let configured = image.withSymbolConfiguration(.init(pointSize: 15, weight: .regular)) ?? image
+        configured.isTemplate = true
+        configured.size = NSSize(width: 18, height: 18)
+        return configured
+    }
+
     private func toggleItem(_ title: String, _ action: Selector, state: Bool, enabled: Bool = true) -> NSMenuItem {
         let item = actionItem(title, action, enabled: enabled)
         item.state = state ? .on : .off
@@ -1164,16 +1242,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
-    @objc private func startModeDuration(_ sender: NSMenuItem) {
-        guard let choice = sender.representedObject as? ModeDurationChoice else {
+    @objc private func changeDuration(_ sender: NSMenuItem) {
+        guard let choice = sender.representedObject as? DurationChoice else {
             return
         }
-        startManualSession(mode: choice.mode, duration: choice.duration)
+        activeDurationSeconds = choice.duration
+        guard let activeMode else {
+            lastMessage = "Duration set to \(durationLabel(choice.duration))."
+            rebuildMenu()
+            return
+        }
+
+        startManualSession(mode: activeMode, duration: choice.duration)
     }
 
-    @objc private func turnOffClicked() {
-        stopSession()
-        rebuildMenu()
+    @objc private func toggleNoAjarMode() {
+        toggleMode(.noAjar)
+    }
+
+    @objc private func toggleAwakeMode() {
+        toggleMode(.awake)
+    }
+
+    private func toggleMode(_ mode: AwakeMode) {
+        if activeMode == mode {
+            stopSession()
+            rebuildMenu()
+            return
+        }
+
+        startManualSession(mode: mode, duration: activeDurationSeconds)
     }
 
     @objc private func setBatteryThreshold(_ sender: NSMenuItem) {
@@ -1316,6 +1414,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    @objc private func tryBetaUpdatesClicked() {
+        guard sparkleUpdater != nil else { return }
+        betaUpdateCheckInProgress = true
+        sparkleUpdaterController?.checkForUpdates(nil)
+        rebuildMenu()
+    }
+
     @objc private func quitClicked() {
         NSApp.terminate(nil)
     }
@@ -1342,7 +1447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupSparkleUpdater() {
         sparkleUpdaterController = SPUStandardUpdaterController(
             startingUpdater: true,
-            updaterDelegate: nil,
+            updaterDelegate: self,
             userDriverDelegate: nil
         )
     }
@@ -1351,9 +1456,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sparkleUpdaterController?.updater
     }
 
+    func feedURLString(for updater: SPUUpdater) -> String? {
+        betaUpdateCheckInProgress ? betaAppcastURLString : nil
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        betaUpdateCheckInProgress = false
+        rebuildMenu()
+    }
+
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        betaUpdateCheckInProgress = false
+        rebuildMenu()
+    }
+
     private func toggleFromHotKey() {
         guard !isRecordingHotKey else { return }
+        let now = Date()
+        if let lastHotKeyActivationAt,
+           now.timeIntervalSince(lastHotKeyActivationAt) < 0.6 {
+            return
+        }
+        guard !isMenuOpen else { return }
 
+        lastHotKeyActivationAt = now
         rebuildMenu()
         statusItem.button?.performClick(nil)
     }
@@ -1404,6 +1534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             session = newSession
             sessionSource = source
             activeMode = mode
+            activeDurationSeconds = duration
             sessionEndsAt = duration.map { Date().addingTimeInterval($0) }
             lastMessage = nil
             syncLidBrightness()
@@ -1702,6 +1833,17 @@ private func durationLabel(_ seconds: TimeInterval?) -> String {
         return "8 Hours"
     default:
         return "\(Int(seconds / 60)) Minutes"
+    }
+}
+
+private func durationsMatch(_ lhs: TimeInterval?, _ rhs: TimeInterval?) -> Bool {
+    switch (lhs, rhs) {
+    case (nil, nil):
+        return true
+    case let (lhs?, rhs?):
+        return Int(lhs) == Int(rhs)
+    default:
+        return false
     }
 }
 
