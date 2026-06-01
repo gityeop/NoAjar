@@ -14,6 +14,118 @@ private enum SessionSource {
     case automation
 }
 
+private let betaAppcastURLString = "https://github.com/gityeop/NoAjar/releases/download/beta/appcast-beta.xml"
+
+private func bundledNoAjarCLIURL() -> URL? {
+    let bundledURL = Bundle.main.bundleURL
+        .appendingPathComponent("Contents")
+        .appendingPathComponent("Helpers")
+        .appendingPathComponent("noajar")
+    if FileManager.default.isExecutableFile(atPath: bundledURL.path) {
+        return bundledURL
+    }
+
+    return nil
+}
+
+private func performHotspotKeepaliveInHelper(targetSSID: String?, forceReconnect: Bool) -> HotspotKeepaliveResult {
+    guard let helperURL = bundledNoAjarCLIURL() else {
+        return HotspotKeepaliveResult(
+            success: false,
+            message: "Hotspot Keepalive: bundled helper was not found."
+        )
+    }
+
+    let process = Process()
+    process.executableURL = helperURL
+    process.arguments = ["hotspot-keepalive"]
+    if let targetSSID,
+       !targetSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        process.arguments?.append(contentsOf: ["--hotspot-ssid", targetSSID])
+    }
+    if forceReconnect {
+        process.arguments?.append("--force-reconnect")
+    }
+
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardOutput = stdout
+    process.standardError = stderr
+
+    do {
+        try process.run()
+    } catch {
+        return HotspotKeepaliveResult(
+            success: false,
+            message: "Hotspot Keepalive: helper could not start: \(error.localizedDescription)"
+        )
+    }
+
+    let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    process.waitUntilExit()
+
+    var success = process.terminationStatus == 0
+    var didReconnect = false
+    var message = [output, error]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n")
+
+    for line in output.split(separator: "\n").map(String.init) {
+        if line == "success=1" {
+            success = true
+        } else if line == "success=0" {
+            success = false
+        } else if line == "didReconnect=1" {
+            didReconnect = true
+        } else if line == "didReconnect=0" {
+            didReconnect = false
+        } else if line.hasPrefix("message=") {
+            message = String(line.dropFirst("message=".count))
+        }
+    }
+
+    if process.terminationStatus != 0, let targetSSID {
+        if currentWiFiNetworkName(allowSlowLookup: true) == targetSSID ||
+            (hotspotFailureMayStillComplete(message) && waitForHotspotConnection(targetSSID: targetSSID, timeout: 24)) {
+            return HotspotKeepaliveResult(
+                success: true,
+                message: "Hotspot Keepalive: connected to Instant Hotspot \(targetSSID).",
+                didReconnect: true
+            )
+        }
+    }
+
+    if process.terminationStatus != 0, message.isEmpty {
+        message = "Hotspot Keepalive: helper exited unexpectedly."
+    }
+
+    return HotspotKeepaliveResult(success: success, message: message, didReconnect: didReconnect)
+}
+
+private func hotspotFailureMayStillComplete(_ message: String) -> Bool {
+    let normalized = message.lowercased()
+        .replacingOccurrences(of: "\u{2018}", with: "'")
+        .replacingOccurrences(of: "\u{2019}", with: "'")
+    return normalized.contains("80211api") ||
+        normalized.contains("-3900") ||
+        normalized.contains("tmperr") ||
+        normalized.contains("wi-fi join failed") ||
+        normalized.contains("association")
+}
+
+private func waitForHotspotConnection(targetSSID: String, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if currentWiFiNetworkName(allowSlowLookup: false) == targetSSID {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 1)
+    }
+    return currentWiFiNetworkName(allowSlowLookup: true) == targetSSID
+}
+
 private struct HotKeyShortcut {
     let storageValue: String
     let displayName: String
@@ -788,18 +900,29 @@ private final class PrivilegedNoAjarHelperClient {
     }
 }
 
-private final class ModeDurationChoice: NSObject {
-    let mode: AwakeMode
+private final class DurationChoice: NSObject {
     let duration: TimeInterval?
 
-    init(mode: AwakeMode, duration: TimeInterval?) {
-        self.mode = mode
+    init(duration: TimeInterval?) {
         self.duration = duration
     }
 }
 
+private enum HotspotKeepaliveTiming {
+    static let connectedSoon: TimeInterval = 10
+    static let stableConnected: TimeInterval = 45
+    static let aliveButUnconfirmed: TimeInterval = 30
+    static let disconnectedRetry: TimeInterval = 8
+    static let disconnectedRetryStep: TimeInterval = 6
+    static let disconnectedRetryMax: TimeInterval = 30
+    static let activeFailureRetry: TimeInterval = 20
+    static let activeFailureRetryStep: TimeInterval = 15
+    static let activeFailureRetryMax: TimeInterval = 60
+    static let confirmationWindow: TimeInterval = 60
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpdaterDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let launchAgent = LaunchAgent(label: "dev.local.noajar")
@@ -809,21 +932,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var session: LidAwakeSession?
     private var sessionSource: SessionSource?
     private var activeMode: AwakeMode?
+    private var activeDurationSeconds: TimeInterval?
     private var sessionEndsAt: Date?
     private var monitorTimer: Timer?
     private var lidBrightnessTimer: Timer?
+    private var hotspotKeepaliveTimer: Timer?
     private var hotKeyController: HotKeyController?
     private var isRecordingHotKey = false
 
     private var minBatteryPercent = 30
     private var batteryStopEnabled = true
+    private var hotspotKeepaliveEnabled = false
+    private var hotspotSSID: String?
+    private var hotspotKeepaliveInProgress = false
+    private var hotspotKeepaliveFailureCount = 0
+    private var lastHotspotConnectionConfirmedAt: Date?
     private var autoWatchedApps = false
     private var autoAwakeMode = AwakeMode.awake
     private var hotKeyEnabled = true
     private var hotKeyShortcut = HotKeyShortcut.defaultShortcut
+    private var betaUpdateCheckInProgress = false
     private var watchedApps: [String] = []
     private var lastAutomationReasons: [String] = []
     private var lastMessage: String?
+    private var isMenuOpen = false
+    private var lastHotKeyActivationAt: Date?
     private var automationSuppressedUntil: Date?
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
@@ -832,6 +965,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "NoAjar"
         repairStaleStateIfNeeded()
         loadPreferences()
+        menu.delegate = self
         setupSparkleUpdater()
         setupHotKey()
         monitorTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -850,8 +984,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         monitorTimer?.invalidate()
         lidBrightnessTimer?.invalidate()
+        hotspotKeepaliveTimer?.invalidate()
         stopSession()
         lidBrightnessController.restoreIfNeeded()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+        lastHotKeyActivationAt = Date()
     }
 
     private func loadPreferences() {
@@ -864,6 +1008,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         minBatteryPercent = defaults.object(forKey: "minBatteryPercent") as? Int ?? 30
         batteryStopEnabled = defaults.object(forKey: "batteryGuardEnabled") as? Bool ?? true
+        hotspotKeepaliveEnabled = defaults.bool(forKey: "hotspotKeepaliveEnabled")
+        hotspotSSID = defaults.string(forKey: "hotspotSSID")?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
 
         if let rawMode = defaults.string(forKey: "autoAwakeMode"),
            let mode = AwakeMode(rawValue: rawMode) {
@@ -878,6 +1024,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let defaults = UserDefaults.standard
         defaults.set(true, forKey: "allowBattery")
         defaults.set(batteryStopEnabled, forKey: "batteryGuardEnabled")
+        defaults.set(hotspotKeepaliveEnabled, forKey: "hotspotKeepaliveEnabled")
+        if let hotspotSSID {
+            defaults.set(hotspotSSID, forKey: "hotspotSSID")
+        } else {
+            defaults.removeObject(forKey: "hotspotSSID")
+        }
         defaults.set(false, forKey: "preventDisplaySleep")
         defaults.set(autoWatchedApps, forKey: "autoWatchedApps")
         defaults.set(false, forKey: "powerProtectEnabled")
@@ -892,21 +1044,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.removeAllItems()
         menu.autoenablesItems = false
 
-        let active = session != nil
         statusItem.button?.title = menuBarStatusTitle()
 
         menu.addItem(statusHeaderMenuItem())
         menu.addItem(.separator())
-        menu.addItem(modeMenuItem(.awake))
-        menu.addItem(modeMenuItem(.noAjar))
-        addItem("Turn Off", #selector(turnOffClicked), keyEquivalent: "0", keyEquivalentModifierMask: [], enabled: active)
+        menu.addItem(modeToggleMenuItem(.noAjar))
+        menu.addItem(modeToggleMenuItem(.awake))
+        menu.addItem(durationMenuItem())
+        menu.addItem(hotspotConnectionMenuItem())
 
         menu.addItem(.separator())
         menu.addItem(appsMenuItem())
         menu.addItem(preferencesMenuItem())
 
         menu.addItem(.separator())
-        addItem("Quit", #selector(quitClicked), keyEquivalent: "q", keyEquivalentModifierMask: [.command])
+        let quitItem = actionItem("Quit", #selector(quitClicked), keyEquivalent: "q", keyEquivalentModifierMask: [.command])
+        applyIcon("rectangle.portrait.and.arrow.right", to: quitItem)
+        menu.addItem(quitItem)
 
         statusItem.menu = menu
     }
@@ -966,6 +1120,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .systemOrange
             ))
         }
+        if hotspotKeepaliveEnabled {
+            let target = hotspotSSID.map { " -> \($0)" } ?? ""
+            rows.append((
+                "Keep Hotspot Connected: On\(target)",
+                .systemFont(ofSize: 13, weight: .regular),
+                .secondaryLabelColor
+            ))
+        }
         return rows
     }
 
@@ -1003,24 +1165,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "\(max(1, remaining / 60))m left"
     }
 
-    private func modeMenuItem(_ mode: AwakeMode) -> NSMenuItem {
-        let parent = NSMenuItem(
-            title: mode.displayName,
-            action: nil,
-            keyEquivalent: ""
+    private func modeToggleMenuItem(_ mode: AwakeMode) -> NSMenuItem {
+        let item = actionItem(
+            mode.displayName,
+            mode == .noAjar ? #selector(toggleNoAjarMode) : #selector(toggleAwakeMode)
         )
-        parent.state = activeMode == mode ? .on : .off
+        item.state = activeMode == mode ? .on : .off
+        applyIcon(mode == .noAjar ? "waveform.path.ecg" : "cup.and.saucer", to: item)
+        return item
+    }
+
+    private func durationMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Duration: \(durationLabel(activeDurationSeconds))", action: nil, keyEquivalent: "")
+        applyIcon("clock", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
-        for (index, option) in durationOptions.enumerated() {
+        for option in durationOptions {
             let item = NSMenuItem(
-                title: "Start \(option.title)",
-                action: #selector(startModeDuration(_:)),
-                keyEquivalent: "\(index + 1)"
+                title: option.title,
+                action: #selector(changeDuration(_:)),
+                keyEquivalent: ""
             )
             item.target = self
-            item.representedObject = ModeDurationChoice(mode: mode, duration: option.seconds)
-            item.keyEquivalentModifierMask = mode == .awake ? [] : [.option]
+            item.representedObject = DurationChoice(duration: option.seconds)
+            item.state = durationsMatch(activeDurationSeconds, option.seconds) ? .on : .off
             submenu.addItem(item)
         }
         submenu.addItem(.separator())
@@ -1029,14 +1197,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return parent
     }
 
+    private func hotspotConnectionMenuItem() -> NSMenuItem {
+        let title = hotspotKeepaliveEnabled ? "Keep Hotspot Connected: On" : "Keep Hotspot Connected: Off"
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        parent.state = hotspotKeepaliveEnabled ? .on : .off
+        applyIcon("wifi", to: parent)
+
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        let toggle = toggleItem("Keep Hotspot Connected", #selector(toggleHotspotKeepalive), state: hotspotKeepaliveEnabled)
+        applyIcon("wifi", to: toggle)
+        submenu.addItem(toggle)
+
+        let hotspot = disabledItem("Hotspot: \(hotspotSSID ?? "Not Set")")
+        applyIcon("iphone", to: hotspot)
+        submenu.addItem(hotspot)
+
+        submenu.addItem(.separator())
+        submenu.addItem(iconItem("Use Current Wi-Fi as Hotspot", #selector(useCurrentWiFiAsHotspot), symbolName: "antenna.radiowaves.left.and.right"))
+        submenu.addItem(iconItem("Forget Hotspot", #selector(clearHotspotNetwork), symbolName: "trash", enabled: hotspotSSID != nil))
+
+        parent.submenu = submenu
+        return parent
+    }
+
     private func appsMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Apps", action: nil, keyEquivalent: "")
+        applyIcon("square.grid.2x2", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
-        submenu.addItem(toggleItem("App Auto Awake", #selector(toggleAutoWatchedApps), state: autoWatchedApps))
-        submenu.addItem(actionItem("Add Apps...", #selector(editWatchedApps)))
-        submenu.addItem(actionItem("Clear Apps", #selector(clearWatchedApps), enabled: !watchedApps.isEmpty))
+        let autoAwake = toggleItem("App Auto Awake", #selector(toggleAutoWatchedApps), state: autoWatchedApps)
+        applyIcon("bolt", to: autoAwake)
+        submenu.addItem(autoAwake)
+        submenu.addItem(iconItem("Add Apps...", #selector(editWatchedApps), symbolName: "plus.app"))
+        submenu.addItem(iconItem("Clear Apps", #selector(clearWatchedApps), symbolName: "trash", enabled: !watchedApps.isEmpty))
         submenu.addItem(appAutoModeMenuItem())
         submenu.addItem(disabledItem("Apps: \(watchedApps.joined(separator: ", "))"))
 
@@ -1046,25 +1241,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func preferencesMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        applyIcon("gearshape", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
         submenu.addItem(hotkeyMenuItem())
-        submenu.addItem(toggleItem("Launch at Login", #selector(toggleLaunchAtLogin), state: launchAgent.isEnabled))
+        let launchAtLogin = toggleItem("Launch at Login", #selector(toggleLaunchAtLogin), state: launchAgent.isEnabled)
+        applyIcon("arrow.clockwise.circle", to: launchAtLogin)
+        submenu.addItem(launchAtLogin)
         submenu.addItem(.separator())
-        submenu.addItem(actionItem("Check for Updates...", #selector(checkForUpdatesClicked), enabled: sparkleUpdater != nil))
-        submenu.addItem(toggleItem(
+        submenu.addItem(iconItem("Check for Updates...", #selector(checkForUpdatesClicked), symbolName: "arrow.down.circle", enabled: sparkleUpdater != nil))
+        let updateChecks = toggleItem(
             "Automatically Check for Updates",
             #selector(toggleAutomaticUpdateChecks),
             state: sparkleUpdater?.automaticallyChecksForUpdates ?? false,
             enabled: sparkleUpdater != nil
-        ))
-        submenu.addItem(toggleItem(
+        )
+        applyIcon("arrow.triangle.2.circlepath", to: updateChecks)
+        submenu.addItem(updateChecks)
+        let installUpdates = toggleItem(
             "Automatically Install Updates",
             #selector(toggleAutomaticInstallUpdates),
             state: sparkleUpdater?.automaticallyDownloadsUpdates ?? false,
             enabled: sparkleUpdater?.allowsAutomaticUpdates ?? false
-        ))
+        )
+        applyIcon("arrow.down.app", to: installUpdates)
+        submenu.addItem(installUpdates)
+        let betaUpdates = iconItem(
+            betaUpdateCheckInProgress ? "Checking Beta Updates..." : "Try Beta Updates",
+            #selector(tryBetaUpdatesClicked),
+            symbolName: "sparkles",
+            enabled: sparkleUpdater != nil && !betaUpdateCheckInProgress
+        )
+        submenu.addItem(betaUpdates)
         submenu.addItem(disabledItem("Version: \(appVersionDisplay())"))
 
         parent.submenu = submenu
@@ -1073,11 +1282,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hotkeyMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Hotkey: \(hotKeyShortcut.displayName)", action: nil, keyEquivalent: "")
+        applyIcon("keyboard", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
-        submenu.addItem(toggleItem("Enabled", #selector(toggleHotKey), state: hotKeyEnabled))
-        submenu.addItem(actionItem("Set Hotkey...", #selector(setHotKeyShortcut)))
+        let enabled = toggleItem("Enabled", #selector(toggleHotKey), state: hotKeyEnabled)
+        applyIcon("checkmark.circle", to: enabled)
+        submenu.addItem(enabled)
+        submenu.addItem(iconItem("Set Hotkey...", #selector(setHotKeyShortcut), symbolName: "keyboard.badge.ellipsis"))
 
         parent.submenu = submenu
         return parent
@@ -1086,6 +1298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func batteryThresholdMenuItem() -> NSMenuItem {
         let title = batteryStopEnabled ? "Stop Below \(minBatteryPercent)%" : "Stop Below: Keep Running"
         let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        applyIcon("battery.75percent", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         let keepRunningItem = NSMenuItem(title: "Keep Running", action: #selector(setBatteryThreshold(_:)), keyEquivalent: "")
@@ -1107,6 +1320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func appAutoModeMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Mode: \(autoAwakeMode.displayName)", action: nil, keyEquivalent: "")
+        applyIcon("slider.horizontal.3", to: parent)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         for mode in AwakeMode.allCases {
@@ -1152,6 +1366,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
+    private func iconItem(
+        _ title: String,
+        _ action: Selector,
+        symbolName: String,
+        keyEquivalent: String = "",
+        keyEquivalentModifierMask: NSEvent.ModifierFlags? = nil,
+        enabled: Bool = true
+    ) -> NSMenuItem {
+        let item = actionItem(
+            title,
+            action,
+            keyEquivalent: keyEquivalent,
+            keyEquivalentModifierMask: keyEquivalentModifierMask,
+            enabled: enabled
+        )
+        applyIcon(symbolName, to: item)
+        return item
+    }
+
+    @discardableResult
+    private func applyIcon(_ symbolName: String, to item: NSMenuItem) -> NSMenuItem {
+        item.image = menuIcon(symbolName)
+        return item
+    }
+
+    private func menuIcon(_ symbolName: String) -> NSImage? {
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else {
+            return nil
+        }
+        let configured = image.withSymbolConfiguration(.init(pointSize: 15, weight: .regular)) ?? image
+        configured.isTemplate = true
+        configured.size = NSSize(width: 18, height: 18)
+        return configured
+    }
+
     private func toggleItem(_ title: String, _ action: Selector, state: Bool, enabled: Bool = true) -> NSMenuItem {
         let item = actionItem(title, action, enabled: enabled)
         item.state = state ? .on : .off
@@ -1164,16 +1413,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
-    @objc private func startModeDuration(_ sender: NSMenuItem) {
-        guard let choice = sender.representedObject as? ModeDurationChoice else {
+    @objc private func changeDuration(_ sender: NSMenuItem) {
+        guard let choice = sender.representedObject as? DurationChoice else {
             return
         }
-        startManualSession(mode: choice.mode, duration: choice.duration)
+        activeDurationSeconds = choice.duration
+        guard let activeMode else {
+            lastMessage = "Duration set to \(durationLabel(choice.duration))."
+            rebuildMenu()
+            return
+        }
+
+        startManualSession(mode: activeMode, duration: choice.duration)
     }
 
-    @objc private func turnOffClicked() {
-        stopSession()
-        rebuildMenu()
+    @objc private func toggleNoAjarMode() {
+        toggleMode(.noAjar)
+    }
+
+    @objc private func toggleAwakeMode() {
+        toggleMode(.awake)
+    }
+
+    private func toggleMode(_ mode: AwakeMode) {
+        if activeMode == mode {
+            stopSession()
+            rebuildMenu()
+            return
+        }
+
+        startManualSession(mode: mode, duration: activeDurationSeconds)
     }
 
     @objc private func setBatteryThreshold(_ sender: NSMenuItem) {
@@ -1189,6 +1458,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastMessage = "Battery setting applies to the next session."
         }
         savePreferences()
+        rebuildMenu()
+    }
+
+    @objc private func toggleHotspotKeepalive() {
+        hotspotKeepaliveEnabled.toggle()
+        if hotspotKeepaliveEnabled, hotspotSSID == nil {
+            hotspotSSID = wifiStatus().currentSSID
+        }
+        if !hotspotKeepaliveEnabled {
+            resetHotspotKeepaliveSchedule()
+        }
+        savePreferences()
+        if hotspotKeepaliveEnabled, let hotspotSSID {
+            lastMessage = "Keep Hotspot Connected enabled for \(hotspotSSID)."
+        } else {
+            lastMessage = hotspotKeepaliveEnabled ? "Keep Hotspot Connected enabled." : "Keep Hotspot Connected disabled."
+        }
+        runHotspotKeepalive(showSuccess: true)
+        rebuildMenu()
+    }
+
+    @objc private func useCurrentWiFiAsHotspot() {
+        let ssid: String
+        if let currentSSID = currentWiFiNetworkName(allowSlowLookup: true)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty {
+            ssid = currentSSID
+        } else if let enteredSSID = promptHotspotSSID(defaultValue: hotspotSSID ?? wifiStatus().currentSSID) {
+            ssid = enteredSSID
+        } else {
+            return
+        }
+
+        hotspotSSID = ssid
+        hotspotKeepaliveEnabled = true
+        resetHotspotKeepaliveSchedule()
+        savePreferences()
+        lastMessage = "Hotspot set to \(ssid)."
+        runHotspotKeepalive(showSuccess: true)
+        rebuildMenu()
+    }
+
+    @objc private func clearHotspotNetwork() {
+        hotspotSSID = nil
+        resetHotspotKeepaliveSchedule()
+        savePreferences()
+        lastMessage = "Hotspot forgotten."
         rebuildMenu()
     }
 
@@ -1316,6 +1632,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    @objc private func tryBetaUpdatesClicked() {
+        guard sparkleUpdater != nil else { return }
+        betaUpdateCheckInProgress = true
+        sparkleUpdaterController?.checkForUpdates(nil)
+        rebuildMenu()
+    }
+
     @objc private func quitClicked() {
         NSApp.terminate(nil)
     }
@@ -1342,7 +1665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupSparkleUpdater() {
         sparkleUpdaterController = SPUStandardUpdaterController(
             startingUpdater: true,
-            updaterDelegate: nil,
+            updaterDelegate: self,
             userDriverDelegate: nil
         )
     }
@@ -1351,9 +1674,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sparkleUpdaterController?.updater
     }
 
+    func feedURLString(for updater: SPUUpdater) -> String? {
+        betaUpdateCheckInProgress ? betaAppcastURLString : nil
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        betaUpdateCheckInProgress = false
+        rebuildMenu()
+    }
+
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        betaUpdateCheckInProgress = false
+        rebuildMenu()
+    }
+
     private func toggleFromHotKey() {
         guard !isRecordingHotKey else { return }
+        let now = Date()
+        if let lastHotKeyActivationAt,
+           now.timeIntervalSince(lastHotKeyActivationAt) < 0.6 {
+            return
+        }
+        guard !isMenuOpen else { return }
 
+        lastHotKeyActivationAt = now
         rebuildMenu()
         statusItem.button?.performClick(nil)
     }
@@ -1365,10 +1713,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         }
+        if mode == .noAjar, activeMode != .noAjar {
+            promptHotspotKeepaliveForNoAjarStart()
+        }
         if session != nil {
             stopSession()
         }
         startSession(mode: mode, duration: duration, source: .manual, reason: mode.displayName, showErrors: true)
+    }
+
+    private func promptHotspotKeepaliveForNoAjarStart() {
+        guard let hotspotSSID else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Keep Hotspot Connected?"
+        alert.informativeText = "NoAjar can keep \(hotspotSSID) connected while No Ajar Mode is on."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Not Now")
+        alert.addButton(withTitle: hotspotKeepaliveEnabled ? "Keep On" : "Turn On")
+
+        let shouldEnableHotspotKeepalive = alert.runModal() == .alertSecondButtonReturn
+        guard hotspotKeepaliveEnabled != shouldEnableHotspotKeepalive else { return }
+        hotspotKeepaliveEnabled = shouldEnableHotspotKeepalive
+        if !shouldEnableHotspotKeepalive {
+            resetHotspotKeepaliveSchedule()
+        }
+        savePreferences()
     }
 
     private func startSession(
@@ -1394,6 +1764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 durationSeconds: duration,
                 preventDisplaySleep: false,
                 manageLidSleepOverride: !usesNoAjarHelper,
+                hotspotKeepaliveEnabled: hotspotKeepaliveEnabled,
+                hotspotSSID: hotspotSSID,
                 reason: "NoAjar \(reason)"
             )
             let newSession = LidAwakeSession(options: options)
@@ -1404,9 +1776,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             session = newSession
             sessionSource = source
             activeMode = mode
+            activeDurationSeconds = duration
             sessionEndsAt = duration.map { Date().addingTimeInterval($0) }
             lastMessage = nil
             syncLidBrightness()
+            runHotspotKeepalive(showSuccess: false)
             rebuildMenu()
         } catch {
             lastMessage = error.localizedDescription
@@ -1434,6 +1808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionSource = nil
         activeMode = nil
         sessionEndsAt = nil
+        resetHotspotKeepaliveSchedule()
         if shouldRestoreBrightness {
             lidBrightnessController.restoreIfNeeded()
         }
@@ -1444,6 +1819,190 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         checkSafety()
         evaluateAutomation()
         rebuildMenu()
+    }
+
+    private func hotspotKeepaliveTick() {
+        hotspotKeepaliveTimer = nil
+        runHotspotKeepalive(showSuccess: false)
+    }
+
+    private func runHotspotKeepalive(
+        showSuccess: Bool,
+        requiresActiveSession: Bool = true,
+        forceReconnect: Bool = false
+    ) {
+        guard hotspotKeepaliveEnabled else {
+            resetHotspotKeepaliveSchedule()
+            return
+        }
+        guard !hotspotKeepaliveInProgress else { return }
+        if requiresActiveSession {
+            guard session != nil,
+                  activeMode == .noAjar else {
+                resetHotspotKeepaliveSchedule()
+                return
+            }
+        }
+
+        hotspotKeepaliveInProgress = true
+        let targetSSID = hotspotSSID
+        syncHotspotConnectionConfidence(targetSSID: targetSSID)
+        let effectiveForceReconnect = forceReconnect || shouldForceSavedHotspotReconnect(
+            targetSSID: targetSSID,
+            requiresActiveSession: requiresActiveSession
+        )
+        if let targetSSID,
+           shouldShowHotspotConnectionProgress(targetSSID: targetSSID) {
+            lastMessage = "Connecting to \(targetSSID)..."
+            rebuildMenu()
+        }
+        Task.detached(priority: .utility) { [showSuccess, targetSSID, requiresActiveSession, effectiveForceReconnect] in
+            let result = performHotspotKeepaliveInHelper(
+                targetSSID: targetSSID,
+                forceReconnect: effectiveForceReconnect
+            )
+            await self.finishHotspotKeepalive(
+                result,
+                showSuccess: showSuccess,
+                requiresActiveSession: requiresActiveSession
+            )
+        }
+    }
+
+    private func syncHotspotConnectionConfidence(targetSSID: String?) {
+        guard let targetSSID else { return }
+        guard wifiStatus().linkActive else {
+            lastHotspotConnectionConfirmedAt = nil
+            return
+        }
+        if let currentSSID = currentWiFiNetworkName(allowSlowLookup: false),
+           currentSSID != targetSSID {
+            lastHotspotConnectionConfirmedAt = nil
+        }
+    }
+
+    private func shouldForceSavedHotspotReconnect(targetSSID: String?, requiresActiveSession: Bool) -> Bool {
+        guard requiresActiveSession,
+              let targetSSID else { return false }
+        let status = wifiStatus()
+        if status.currentSSID == targetSSID {
+            lastHotspotConnectionConfirmedAt = Date()
+            return false
+        }
+        if !status.linkActive {
+            return true
+        }
+        return !recentlyConfirmedHotspotConnection(targetSSID: targetSSID)
+    }
+
+    private func recentlyConfirmedHotspotConnection(targetSSID: String) -> Bool {
+        guard hotspotSSID == targetSSID,
+              let lastHotspotConnectionConfirmedAt else { return false }
+        guard wifiStatus().linkActive else { return false }
+        return Date().timeIntervalSince(lastHotspotConnectionConfirmedAt) < HotspotKeepaliveTiming.confirmationWindow
+    }
+
+    private func shouldShowHotspotConnectionProgress(targetSSID: String) -> Bool {
+        if recentlyConfirmedHotspotConnection(targetSSID: targetSSID) {
+            return false
+        }
+        return currentWiFiNetworkName(allowSlowLookup: false) != targetSSID
+    }
+
+    private func finishHotspotKeepalive(
+        _ result: HotspotKeepaliveResult,
+        showSuccess: Bool,
+        requiresActiveSession: Bool
+    ) {
+        hotspotKeepaliveInProgress = false
+        guard hotspotKeepaliveEnabled else {
+            resetHotspotKeepaliveSchedule()
+            return
+        }
+        if requiresActiveSession {
+            guard session != nil,
+                  activeMode == .noAjar else {
+                resetHotspotKeepaliveSchedule()
+                return
+            }
+        }
+
+        let confirmedConnection = resultConfirmsSavedHotspotConnection(result)
+        if confirmedConnection {
+            lastHotspotConnectionConfirmedAt = Date()
+            hotspotKeepaliveFailureCount = 0
+        } else if !result.success {
+            lastHotspotConnectionConfirmedAt = nil
+            hotspotKeepaliveFailureCount += 1
+        } else {
+            hotspotKeepaliveFailureCount = 0
+        }
+        scheduleNextHotspotKeepalive(after: nextHotspotKeepaliveInterval(
+            result: result,
+            confirmedConnection: confirmedConnection
+        ))
+
+        let wasShowingConnectionProgress = hotspotSSID.map { lastMessage == "Connecting to \($0)..." } ?? false
+        if showSuccess || !result.success || result.didReconnect || wasShowingConnectionProgress {
+            if result.success, let hotspotSSID {
+                lastMessage = "Connected to \(hotspotSSID)."
+            } else {
+                lastMessage = result.message
+            }
+            rebuildMenu()
+        }
+    }
+
+    private func resetHotspotKeepaliveSchedule() {
+        hotspotKeepaliveTimer?.invalidate()
+        hotspotKeepaliveTimer = nil
+        hotspotKeepaliveFailureCount = 0
+        lastHotspotConnectionConfirmedAt = nil
+    }
+
+    private func scheduleNextHotspotKeepalive(after interval: TimeInterval) {
+        hotspotKeepaliveTimer?.invalidate()
+        hotspotKeepaliveTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.hotspotKeepaliveTick()
+            }
+        }
+    }
+
+    private func nextHotspotKeepaliveInterval(
+        result: HotspotKeepaliveResult,
+        confirmedConnection: Bool
+    ) -> TimeInterval {
+        if confirmedConnection {
+            return result.didReconnect ? HotspotKeepaliveTiming.connectedSoon : HotspotKeepaliveTiming.stableConnected
+        }
+        if result.success {
+            return HotspotKeepaliveTiming.aliveButUnconfirmed
+        }
+
+        let extraFailures = max(0, hotspotKeepaliveFailureCount - 1)
+        let status = wifiStatus()
+        if !status.linkActive || hotspotSSID.map({ status.currentSSID != $0 }) == true {
+            return min(
+                HotspotKeepaliveTiming.disconnectedRetry +
+                    Double(extraFailures) * HotspotKeepaliveTiming.disconnectedRetryStep,
+                HotspotKeepaliveTiming.disconnectedRetryMax
+            )
+        }
+        return min(
+            HotspotKeepaliveTiming.activeFailureRetry +
+                Double(extraFailures) * HotspotKeepaliveTiming.activeFailureRetryStep,
+            HotspotKeepaliveTiming.activeFailureRetryMax
+        )
+    }
+
+    private func resultConfirmsSavedHotspotConnection(_ result: HotspotKeepaliveResult) -> Bool {
+        guard result.success,
+              let hotspotSSID else { return false }
+        if result.didReconnect {
+            return true
+        }
+        return currentWiFiNetworkName(allowSlowLookup: false) == hotspotSSID
     }
 
     private func syncLidBrightness() {
@@ -1514,6 +2073,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.runModal()
+    }
+
+    private func promptHotspotSSID(defaultValue: String?) -> String? {
+        let alert = NSAlert()
+        alert.messageText = "Enter Hotspot Name"
+        alert.informativeText = "Enter the iPhone hotspot Wi-Fi name exactly as it appears in macOS. NoAjar will keep this hotspot connected while No Ajar Mode is on."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.stringValue = defaultValue ?? ""
+        alert.accessoryView = input
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let ssid = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ssid.isEmpty {
+            showError("Enter a hotspot Wi-Fi name.")
+            return nil
+        }
+        return ssid
     }
 
     private func authorizeNoAjarMode() -> Bool {
@@ -1705,6 +2285,17 @@ private func durationLabel(_ seconds: TimeInterval?) -> String {
     }
 }
 
+private func durationsMatch(_ lhs: TimeInterval?, _ rhs: TimeInterval?) -> Bool {
+    switch (lhs, rhs) {
+    case (nil, nil):
+        return true
+    case let (lhs?, rhs?):
+        return Int(lhs) == Int(rhs)
+    default:
+        return false
+    }
+}
+
 private func fourCharCode(_ value: String) -> OSType {
     var result: OSType = 0
     for byte in value.utf8.prefix(4) {
@@ -1735,6 +2326,12 @@ private func appleScriptEscaped(_ value: String) -> String {
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
         .replacingOccurrences(of: "\n", with: "; ")
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
 }
 
 let app = NSApplication.shared

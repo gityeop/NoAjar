@@ -84,6 +84,17 @@ Settings includes:
 
 - Hotkey: opens the NoAjar menu. The default is Cmd-Opt-L and can be changed.
   Use Set Hotkey to record a shortcut by pressing the keys directly.
+- Hotspot Keepalive: while No Ajar Mode is active, sends a small ping to the
+  current Wi-Fi gateway every 30 seconds. If a hotspot network is saved, NoAjar
+  also asks macOS to reconnect to that Wi-Fi network when the link drops or the
+  Mac moves to another network. This helps with iPhone hotspot interruptions,
+  but it cannot force iOS to advertise a hidden/unavailable hotspot.
+  If the saved hotspot only appears as an Instant Hotspot, NoAjar uses an
+  experimental macOS private API fallback before joining the Wi-Fi network.
+  Use Current Wi-Fi as Hotspot saves the currently connected network as the
+  target hotspot, and Forget Hotspot clears the saved hotspot name.
+- Try Beta Updates: checks the beta update feed once without changing the
+  regular stable update channel.
 - Launch at Login.
 - Check for Updates: opens the update checker.
 - Automatically Check for Updates: checks for updates once per day.
@@ -161,6 +172,18 @@ Allow battery use, but stop at 40%:
 
 ```sh
 noajar start --no-ajar --allow-battery --min-battery 40
+```
+
+Run No Ajar Mode with hotspot keepalive:
+
+```sh
+noajar start --no-ajar --hotspot-keepalive
+```
+
+Run No Ajar Mode and reconnect to a saved hotspot name if Wi-Fi drops:
+
+```sh
+noajar start --no-ajar --hotspot-ssid "My iPhone"
 ```
 
 Check state:

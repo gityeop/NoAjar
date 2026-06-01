@@ -16,14 +16,17 @@ SIGN_IDENTITY := $(if $(strip $(SIGN_IDENTITY)),$(SIGN_IDENTITY),-)
 TIMESTAMP_FLAG := $(if $(filter -,$(SIGN_IDENTITY)),,--timestamp)
 RUNTIME_FLAG := $(if $(filter -,$(SIGN_IDENTITY)),,--options runtime)
 CODESIGN_FLAGS := --force $(RUNTIME_FLAG) $(TIMESTAMP_FLAG) --sign "$(SIGN_IDENTITY)"
+SWIFT_BUILD_FLAGS ?= -c release --arch arm64 --arch x86_64
+SWIFT_RELEASE_BIN_DIR ?= .build/apple/Products/Release
 
 build:
-	swift build -c release
+	swift build $(SWIFT_BUILD_FLAGS)
 
 app:
-	swift build -c release --product noajar
-	swift build -c release --product LidAwakeMenuBar
-	swift build -c release --product NoAjarHelper
+	swift build $(SWIFT_BUILD_FLAGS) --product noajar
+	swift build $(SWIFT_BUILD_FLAGS) --product noajar-hotspot
+	swift build $(SWIFT_BUILD_FLAGS) --product LidAwakeMenuBar
+	swift build $(SWIFT_BUILD_FLAGS) --product NoAjarHelper
 	rm -rf "$(APP_BUNDLE)"
 	install -d "$(APP_BUNDLE)/Contents/MacOS"
 	install -d "$(APP_BUNDLE)/Contents/Resources"
@@ -31,16 +34,18 @@ app:
 	install -d "$(APP_BUNDLE)/Contents/Frameworks"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchServices"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchDaemons"
-	install -m 0755 .build/release/LidAwakeMenuBar "$(APP_BUNDLE)/Contents/MacOS/NoAjar"
-	install -m 0755 .build/release/noajar "$(APP_BUNDLE)/Contents/Helpers/noajar"
-	install -m 0755 .build/release/NoAjarHelper "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
+	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/LidAwakeMenuBar" "$(APP_BUNDLE)/Contents/MacOS/NoAjar"
+	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/noajar" "$(APP_BUNDLE)/Contents/Helpers/noajar"
+	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/noajar-hotspot" "$(APP_BUNDLE)/Contents/Helpers/noajar-hotspot"
+	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/NoAjarHelper" "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
 	install -m 0644 Resources/NoAjarHelper/dev.local.noajar.helper.plist "$(APP_BUNDLE)/Contents/Library/LaunchDaemons/dev.local.noajar.helper.plist"
 	install -m 0644 Resources/LidAwakeApp/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	install -m 0644 Resources/LidAwakeApp/NoAjar.icns "$(APP_BUNDLE)/Contents/Resources/NoAjar.icns"
-	SPARKLE_FRAMEWORK="$$(swift build -c release --show-bin-path)/Sparkle.framework"; test -d "$$SPARKLE_FRAMEWORK"; ditto "$$SPARKLE_FRAMEWORK" "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
+	SPARKLE_FRAMEWORK="$$(swift build $(SWIFT_BUILD_FLAGS) --show-bin-path)/Sparkle.framework"; test -d "$$SPARKLE_FRAMEWORK"; ditto "$$SPARKLE_FRAMEWORK" "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
 	install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP_BUNDLE)/Contents/MacOS/NoAjar" 2>/dev/null || true
 	codesign $(CODESIGN_FLAGS) --identifier dev.local.noajar.helper "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
 	codesign $(CODESIGN_FLAGS) "$(APP_BUNDLE)/Contents/Helpers/noajar"
+	codesign $(CODESIGN_FLAGS) "$(APP_BUNDLE)/Contents/Helpers/noajar-hotspot"
 	codesign $(CODESIGN_FLAGS) --deep "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
 	codesign $(CODESIGN_FLAGS) --deep "$(APP_BUNDLE)"
 
@@ -68,7 +73,7 @@ appcast: notarize
 
 install: build
 	install -d "$(PREFIX)/bin"
-	install -m 0755 .build/release/noajar "$(PREFIX)/bin/noajar"
+	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/noajar" "$(PREFIX)/bin/noajar"
 
 uninstall:
 	rm -f "$(PREFIX)/bin/noajar"

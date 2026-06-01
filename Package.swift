@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .executable(name: "noajar", targets: ["LidAwake"]),
         .executable(name: "LidAwakeMenuBar", targets: ["LidAwakeMenuBar"]),
+        .executable(name: "noajar-hotspot", targets: ["NoAjarHotspotHelper"]),
         .executable(name: "NoAjarHelper", targets: ["NoAjarHelper"])
     ],
     dependencies: [
@@ -29,6 +30,9 @@ let package = Package(
                 "LidAwakeCore",
                 .product(name: "Sparkle", package: "Sparkle")
             ]
+        ),
+        .executableTarget(
+            name: "NoAjarHotspotHelper"
         ),
         .executableTarget(
             name: "NoAjarHelper",

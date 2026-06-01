@@ -84,6 +84,17 @@ Settings에는 다음 항목이 있습니다.
 
 - Hotkey: NoAjar 메뉴를 엽니다. 기본값은 Cmd-Opt-L이며 변경할 수 있습니다.
   Set Hotkey를 눌러 단축키를 직접 입력합니다.
+- Hotspot Keepalive: No Ajar Mode가 활성화된 동안 현재 Wi-Fi 게이트웨이에
+  30초마다 작은 ping을 보냅니다. 핫스팟 네트워크를 저장해두면 Wi-Fi 링크가
+  끊기거나 Mac이 다른 네트워크로 이동했을 때 macOS에 해당 Wi-Fi로 재연결을
+  요청합니다. 아이폰 핫스팟 연결 끊김을 줄이는 데 도움이 되지만, iOS가 숨기거나
+  사용할 수 없게 만든 핫스팟을 강제로 나타나게 하지는 못합니다.
+  저장된 핫스팟이 Instant Hotspot으로만 보이면 실험적인 macOS private API
+  fallback으로 핫스팟 활성화를 요청한 뒤 Wi-Fi 연결을 시도합니다.
+  Use Current Wi-Fi as Hotspot은 현재 연결된 네트워크를 대상 핫스팟으로
+  저장하고, Forget Hotspot은 저장된 핫스팟 이름을 지웁니다.
+- Try Beta Updates: 안정판 업데이트 채널은 바꾸지 않고 베타 업데이트 feed를
+  한 번 확인합니다.
 - Launch at Login
 - Check for Updates: 업데이트 확인 창을 엽니다.
 - Automatically Check for Updates: 하루에 한 번 업데이트를 확인합니다.
@@ -160,6 +171,18 @@ noajar start --awake --duration 1h
 
 ```sh
 noajar start --no-ajar --allow-battery --min-battery 40
+```
+
+핫스팟 keepalive와 함께 No Ajar Mode 실행:
+
+```sh
+noajar start --no-ajar --hotspot-keepalive
+```
+
+Wi-Fi가 끊겼을 때 저장한 핫스팟 이름으로 재연결:
+
+```sh
+noajar start --no-ajar --hotspot-ssid "My iPhone"
 ```
 
 상태 확인:
