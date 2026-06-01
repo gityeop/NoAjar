@@ -14,7 +14,15 @@ private enum SessionSource {
     case automation
 }
 
+private struct AutomationDecision {
+    let mode: AwakeMode
+    let reasons: [String]
+    let scheduleWindow: NoAjarScheduleWindow?
+}
+
 private let betaAppcastURLString = "https://github.com/gityeop/NoAjar/releases/download/beta/appcast-beta.xml"
+private let scheduleSettingsDefaultsKey = "scheduleSettings"
+private let scheduleSuppressionsDefaultsKey = "scheduleSuppressions"
 
 private func bundledNoAjarCLIURL() -> URL? {
     let bundledURL = Bundle.main.bundleURL
@@ -680,6 +688,385 @@ private final class HotKeyPromptController: NSObject {
     }
 }
 
+private final class WeekdayPillButton: NSButton {
+    var isOn = false {
+        didSet { updateStyle() }
+    }
+
+    init(title: String, fullTitle: String) {
+        super.init(frame: .zero)
+        self.title = title
+        toolTip = fullTitle
+        isBordered = false
+        wantsLayer = true
+        font = .systemFont(ofSize: 12, weight: .medium)
+        alignment = .center
+        setButtonType(.momentaryChange)
+        updateStyle()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 54, height: 30)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isOn.toggle()
+        sendAction(action, to: target)
+    }
+
+    private func updateStyle() {
+        layer?.cornerRadius = 8
+        layer?.backgroundColor = isOn
+            ? NSColor.controlAccentColor.cgColor
+            : NSColor.controlBackgroundColor.withAlphaComponent(0.95).cgColor
+        attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: isOn ? NSColor.white : NSColor.labelColor
+            ]
+        )
+    }
+}
+
+private final class ScheduleRuleEditorRow: NSView {
+    var onChange: (() -> Void)?
+    var onDelete: ((ScheduleRuleEditorRow) -> Void)?
+
+    private let enabledButton = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
+    private let modeControl = NSSegmentedControl(labels: ["Awake", "No Ajar"], trackingMode: .selectOne, target: nil, action: nil)
+    private let keepHotspotButton = NSButton(checkboxWithTitle: "Hotspot", target: nil, action: nil)
+    private let startPicker = NSDatePicker()
+    private let endPicker = NSDatePicker()
+    private let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
+    private var weekdayButtons: [(value: Int, button: WeekdayPillButton)] = []
+    private let ruleID: String
+
+    init(rule: NoAjarScheduleRule) {
+        ruleID = rule.id
+        super.init(frame: NSRect(x: 0, y: 0, width: 680, height: 110))
+        setupView(rule: rule)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func rule() -> NoAjarScheduleRule {
+        let mode: AwakeMode = modeControl.selectedSegment == 1 ? .noAjar : .awake
+        return NoAjarScheduleRule(
+            id: ruleID,
+            enabled: enabledButton.state == .on,
+            mode: mode,
+            keepHotspotConnected: mode == .noAjar && keepHotspotButton.state == .on,
+            weekdays: selectedWeekdays(),
+            startMinute: minuteOfDay(from: startPicker.dateValue),
+            endMinute: minuteOfDay(from: endPicker.dateValue)
+        )
+    }
+
+    @objc private func controlChanged() {
+        updateHotspotControlState()
+        onChange?()
+    }
+
+    @objc private func deleteClicked() {
+        onDelete?(self)
+    }
+
+    private func setupView(rule: NoAjarScheduleRule) {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.35).cgColor
+        layer?.cornerRadius = 8
+
+        enabledButton.target = self
+        enabledButton.action = #selector(controlChanged)
+        enabledButton.state = rule.enabled ? .on : .off
+
+        modeControl.target = self
+        modeControl.action = #selector(controlChanged)
+        modeControl.selectedSegment = rule.mode == .noAjar ? 1 : 0
+        modeControl.setWidth(74, forSegment: 0)
+        modeControl.setWidth(84, forSegment: 1)
+
+        keepHotspotButton.target = self
+        keepHotspotButton.action = #selector(controlChanged)
+        keepHotspotButton.state = rule.keepHotspotConnected ? .on : .off
+        keepHotspotButton.toolTip = "Keep the saved hotspot connected while this schedule is running."
+        updateHotspotControlState()
+
+        configureTimePicker(startPicker, minute: rule.startMinute)
+        configureTimePicker(endPicker, minute: rule.endMinute)
+
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteClicked)
+        deleteButton.bezelStyle = .rounded
+
+        let topStack = NSStackView(views: [
+            enabledButton,
+            modeControl,
+            label("Start"),
+            startPicker,
+            label("End"),
+            endPicker,
+            deleteButton
+        ])
+        topStack.orientation = .horizontal
+        topStack.alignment = .centerY
+        topStack.spacing = 10
+
+        let dayStack = NSStackView()
+        dayStack.orientation = .horizontal
+        dayStack.alignment = .centerY
+        dayStack.spacing = 6
+        for weekday in scheduleWeekdays {
+            let button = WeekdayPillButton(title: weekday.title, fullTitle: weekday.fullTitle)
+            button.target = self
+            button.action = #selector(controlChanged)
+            button.isOn = rule.normalizedWeekdays.contains(weekday.value)
+            weekdayButtons.append((weekday.value, button))
+            dayStack.addArrangedSubview(button)
+        }
+
+        let bottomStack = NSStackView(views: [dayStack, keepHotspotButton])
+        bottomStack.orientation = .horizontal
+        bottomStack.alignment = .centerY
+        bottomStack.spacing = 14
+
+        let stack = NSStackView(views: [topStack, bottomStack])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            modeControl.widthAnchor.constraint(equalToConstant: 164),
+            startPicker.widthAnchor.constraint(equalToConstant: 86),
+            endPicker.widthAnchor.constraint(equalToConstant: 86)
+        ])
+    }
+
+    private func updateHotspotControlState() {
+        let noAjarSelected = modeControl.selectedSegment == 1
+        keepHotspotButton.isEnabled = noAjarSelected
+        if !noAjarSelected {
+            keepHotspotButton.state = .off
+        }
+    }
+
+    private func selectedWeekdays() -> [Int] {
+        weekdayButtons.compactMap { $0.button.isOn ? $0.value : nil }
+    }
+
+    private func configureTimePicker(_ picker: NSDatePicker, minute: Int) {
+        picker.datePickerMode = .single
+        picker.datePickerStyle = .textFieldAndStepper
+        picker.datePickerElements = [.hourMinute]
+        picker.dateValue = dateForMinuteOfDay(minute)
+        picker.target = self
+        picker.action = #selector(controlChanged)
+        picker.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+    }
+
+    private func label(_ title: String) -> NSTextField {
+        let field = NSTextField(labelWithString: title)
+        field.font = .systemFont(ofSize: 12)
+        field.textColor = .secondaryLabelColor
+        return field
+    }
+}
+
+@MainActor
+private final class ScheduleEditorController: NSObject {
+    private let panel: NSPanel
+    private let enabledButton = NSButton(checkboxWithTitle: "Scheduled Mode", target: nil, action: nil)
+    private let rowsStack = NSStackView()
+    private let rowsDocumentView = NSView(frame: NSRect(x: 0, y: 0, width: 688, height: 285))
+    private let errorLabel = NSTextField(labelWithString: "")
+    private let saveButton = NSButton(title: "Save", target: nil, action: nil)
+    private var rows: [ScheduleRuleEditorRow] = []
+    private var result: NoAjarScheduleSettings?
+
+    init(settings: NoAjarScheduleSettings) {
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 500),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+        setupPanel(settings: settings)
+    }
+
+    func run() -> NoAjarScheduleSettings? {
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+        return result
+    }
+
+    @objc private func addRule() {
+        appendRow(NoAjarScheduleRule())
+        validate()
+    }
+
+    @objc private func save() {
+        validate()
+        guard saveButton.isEnabled else { return }
+        result = NoAjarScheduleSettings(
+            isEnabled: enabledButton.state == .on,
+            rules: rows.map { $0.rule() }
+        )
+        NSApp.stopModal()
+    }
+
+    @objc private func cancel() {
+        result = nil
+        NSApp.stopModal()
+    }
+
+    @objc private func enabledChanged() {
+        validate()
+    }
+
+    private func setupPanel(settings: NoAjarScheduleSettings) {
+        panel.isReleasedWhenClosed = false
+        panel.title = "Schedules"
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+        panel.standardWindowButton(.closeButton)?.target = self
+        panel.standardWindowButton(.closeButton)?.action = #selector(cancel)
+
+        enabledButton.target = self
+        enabledButton.action = #selector(enabledChanged)
+        enabledButton.state = settings.isEnabled ? .on : .off
+        enabledButton.font = .systemFont(ofSize: 13, weight: .medium)
+
+        let subtitleLabel = NSTextField(labelWithString: "Create time windows that automatically start Awake Mode or No Ajar Mode while this app is running.")
+        subtitleLabel.font = .systemFont(ofSize: 13)
+        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.maximumNumberOfLines = 2
+
+        rowsStack.orientation = .vertical
+        rowsStack.alignment = .leading
+        rowsStack.spacing = 10
+        rowsStack.translatesAutoresizingMaskIntoConstraints = false
+
+        rowsDocumentView.addSubview(rowsStack)
+        NSLayoutConstraint.activate([
+            rowsStack.leadingAnchor.constraint(equalTo: rowsDocumentView.leadingAnchor),
+            rowsStack.trailingAnchor.constraint(equalTo: rowsDocumentView.trailingAnchor),
+            rowsStack.topAnchor.constraint(equalTo: rowsDocumentView.topAnchor),
+            rowsStack.bottomAnchor.constraint(lessThanOrEqualTo: rowsDocumentView.bottomAnchor)
+        ])
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .noBorder
+        scrollView.documentView = rowsDocumentView
+
+        let addButton = NSButton(title: "Add Rule", target: self, action: #selector(addRule))
+        addButton.bezelStyle = .rounded
+        let cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancelButton.bezelStyle = .rounded
+        saveButton.target = self
+        saveButton.action = #selector(save)
+        saveButton.bezelStyle = .rounded
+        saveButton.keyEquivalent = "\r"
+
+        errorLabel.font = .systemFont(ofSize: 12)
+        errorLabel.textColor = .systemRed
+        errorLabel.maximumNumberOfLines = 2
+
+        let buttonStack = NSStackView(views: [addButton, NSView(), cancelButton, saveButton])
+        buttonStack.orientation = .horizontal
+        buttonStack.alignment = .centerY
+        buttonStack.spacing = 10
+
+        let stack = NSStackView(views: [subtitleLabel, enabledButton, scrollView, errorLabel, buttonStack])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let contentView = NSView()
+        contentView.addSubview(stack)
+        panel.contentView = contentView
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
+            scrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            scrollView.heightAnchor.constraint(equalToConstant: 285),
+            buttonStack.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+
+        let initialRules = settings.rules.isEmpty ? [NoAjarScheduleRule()] : settings.rules
+        initialRules.forEach(appendRow)
+        validate()
+    }
+
+    private func appendRow(_ rule: NoAjarScheduleRule) {
+        let row = ScheduleRuleEditorRow(rule: rule)
+        row.onChange = { [weak self] in self?.validate() }
+        row.onDelete = { [weak self] row in
+            self?.removeRow(row)
+        }
+        rows.append(row)
+        rowsStack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalToConstant: 688).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 110).isActive = true
+        updateRowsDocumentFrame()
+    }
+
+    private func removeRow(_ row: ScheduleRuleEditorRow) {
+        rows.removeAll { $0 === row }
+        rowsStack.removeArrangedSubview(row)
+        row.removeFromSuperview()
+        updateRowsDocumentFrame()
+        validate()
+    }
+
+    private func updateRowsDocumentFrame() {
+        let height = max(285, CGFloat(rows.count) * 120)
+        rowsDocumentView.setFrameSize(NSSize(width: 688, height: height))
+    }
+
+    private func validate() {
+        let rules = rows.map { $0.rule() }
+        if let emptyWeekdayRule = rules.first(where: { $0.enabled && $0.normalizedWeekdays.isEmpty }) {
+            saveButton.isEnabled = false
+            errorLabel.stringValue = "Choose at least one day for each enabled rule. Rule \(emptyWeekdayRule.id.prefix(4)) has no days."
+            return
+        }
+
+        let overlappingIDs = NoAjarScheduleEvaluator.overlappingRuleIDs(rules)
+        if !overlappingIDs.isEmpty {
+            saveButton.isEnabled = false
+            errorLabel.stringValue = "Schedule rules cannot overlap on the same day. Adjust the highlighted time windows."
+            return
+        }
+
+        saveButton.isEnabled = true
+        errorLabel.stringValue = ""
+    }
+}
+
 private final class HotKeyController: @unchecked Sendable {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
@@ -944,9 +1331,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private var batteryStopEnabled = true
     private var hotspotKeepaliveEnabled = false
     private var hotspotSSID: String?
+    private var activeSessionHotspotKeepaliveEnabled = false
     private var hotspotKeepaliveInProgress = false
     private var hotspotKeepaliveFailureCount = 0
     private var lastHotspotConnectionConfirmedAt: Date?
+    private var scheduleSettings = NoAjarScheduleSettings()
+    private var scheduleSuppressions: [NoAjarScheduleSuppression] = []
     private var autoWatchedApps = false
     private var autoAwakeMode = AwakeMode.awake
     private var hotKeyEnabled = true
@@ -958,6 +1348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private var isMenuOpen = false
     private var lastHotKeyActivationAt: Date?
     private var automationSuppressedUntil: Date?
+    private var activeAutomationScheduleWindow: NoAjarScheduleWindow?
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -978,7 +1369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 self?.syncLidBrightness()
             }
         }
-        rebuildMenu()
+        monitorTick()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1015,6 +1406,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
            let mode = AwakeMode(rawValue: rawMode) {
             autoAwakeMode = mode
         }
+        if let data = defaults.data(forKey: scheduleSettingsDefaultsKey),
+           let decoded = try? JSONDecoder().decode(NoAjarScheduleSettings.self, from: data) {
+            scheduleSettings = decoded
+        }
+        if let data = defaults.data(forKey: scheduleSuppressionsDefaultsKey),
+           let decoded = try? JSONDecoder().decode([NoAjarScheduleSuppression].self, from: data) {
+            scheduleSuppressions = NoAjarScheduleEvaluator.suppressions(decoded, validAt: Date())
+        }
         if let storedApps = defaults.stringArray(forKey: "watchedApps") {
             watchedApps = storedApps
         }
@@ -1038,6 +1437,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         defaults.set(minBatteryPercent, forKey: "minBatteryPercent")
         defaults.set(autoAwakeMode.rawValue, forKey: "autoAwakeMode")
         defaults.set(watchedApps, forKey: "watchedApps")
+        if let data = try? JSONEncoder().encode(scheduleSettings) {
+            defaults.set(data, forKey: scheduleSettingsDefaultsKey)
+        }
+        if let data = try? JSONEncoder().encode(scheduleSuppressions) {
+            defaults.set(data, forKey: scheduleSuppressionsDefaultsKey)
+        }
     }
 
     private func rebuildMenu() {
@@ -1051,6 +1456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         menu.addItem(modeToggleMenuItem(.noAjar))
         menu.addItem(modeToggleMenuItem(.awake))
         menu.addItem(durationMenuItem())
+        menu.addItem(scheduleMenuItem())
         menu.addItem(hotspotConnectionMenuItem())
 
         menu.addItem(.separator())
@@ -1120,7 +1526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 .systemOrange
             ))
         }
-        if hotspotKeepaliveEnabled {
+        if displayedHotspotKeepaliveEnabled {
             let target = hotspotSSID.map { " -> \($0)" } ?? ""
             rows.append((
                 "Keep Hotspot Connected: On\(target)",
@@ -1129,6 +1535,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             ))
         }
         return rows
+    }
+
+    private var displayedHotspotKeepaliveEnabled: Bool {
+        session == nil ? hotspotKeepaliveEnabled : activeSessionHotspotKeepaliveEnabled
     }
 
     private func menuBarStatusTitle() -> String {
@@ -1195,6 +1605,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         submenu.addItem(batteryThresholdMenuItem())
         parent.submenu = submenu
         return parent
+    }
+
+    private func scheduleMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: scheduleMenuTitle(), action: nil, keyEquivalent: "")
+        parent.state = scheduleSettings.isEnabled ? .on : .off
+        applyIcon("calendar.badge.clock", to: parent)
+
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        submenu.addItem(iconItem("Edit Schedules...", #selector(editSchedules), symbolName: "calendar.badge.plus"))
+        submenu.addItem(.separator())
+        if let active = activeScheduleWindow() {
+            submenu.addItem(disabledItem("Active: \(scheduleSummary(active, prefixWithDay: false))"))
+        } else if let next = NoAjarScheduleEvaluator.nextWindow(settings: scheduleSettings) {
+            submenu.addItem(disabledItem("Next: \(scheduleSummary(next, prefixWithDay: true))"))
+        } else {
+            submenu.addItem(disabledItem(scheduleSettings.isEnabled ? "No upcoming schedule" : "Schedule is off"))
+        }
+
+        parent.submenu = submenu
+        return parent
+    }
+
+    private func scheduleMenuTitle() -> String {
+        guard scheduleSettings.isEnabled else {
+            return "Schedule: Off"
+        }
+        if activeScheduleWindow() != nil {
+            return "Schedule: Active"
+        }
+        let count = scheduleSettings.rules.filter { $0.enabled }.count
+        return count == 1 ? "Schedule: 1 Rule" : "Schedule: \(count) Rules"
+    }
+
+    private func scheduleSummary(_ window: NoAjarScheduleWindow, prefixWithDay: Bool) -> String {
+        let time = "\(timeFormatter.string(from: window.start))-\(timeFormatter.string(from: window.end))"
+        if prefixWithDay {
+            return "\(weekdayFormatter.string(from: window.start)) \(time), \(window.rule.mode.displayName)"
+        }
+        return "\(time), \(window.rule.mode.displayName)"
     }
 
     private func hotspotConnectionMenuItem() -> NSMenuItem {
@@ -1437,6 +1888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
     private func toggleMode(_ mode: AwakeMode) {
         if activeMode == mode {
+            suppressActiveScheduleIfNeeded()
             stopSession()
             rebuildMenu()
             return
@@ -1461,6 +1913,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         rebuildMenu()
     }
 
+    @objc private func editSchedules() {
+        openScheduleEditor(with: scheduleSettings)
+    }
+
+    private func openScheduleEditor(with settings: NoAjarScheduleSettings) {
+        guard let updated = ScheduleEditorController(settings: settings).run() else {
+            rebuildMenu()
+            return
+        }
+        applyScheduleSettings(updated)
+    }
+
+    private func applyScheduleSettings(_ settings: NoAjarScheduleSettings) {
+        if settings.isEnabled,
+           settings.rules.contains(where: { $0.enabled && $0.mode == .noAjar }),
+           !privilegedHelper.isAuthorized,
+           !authorizeNoAjarMode() {
+            rebuildMenu()
+            return
+        }
+
+        let overlappingIDs = NoAjarScheduleEvaluator.overlappingRuleIDs(settings.rules)
+        guard overlappingIDs.isEmpty else {
+            showError("Schedule rules cannot overlap on the same day.")
+            rebuildMenu()
+            return
+        }
+
+        scheduleSettings = settings
+        scheduleSuppressions = NoAjarScheduleEvaluator.suppressions(scheduleSuppressions, validAt: Date())
+        if !scheduleSettings.isEnabled {
+            scheduleSuppressions = []
+        }
+        savePreferences()
+        monitorTick()
+        rebuildMenu()
+    }
+
     @objc private func toggleHotspotKeepalive() {
         hotspotKeepaliveEnabled.toggle()
         if hotspotKeepaliveEnabled, hotspotSSID == nil {
@@ -1468,6 +1958,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         }
         if !hotspotKeepaliveEnabled {
             resetHotspotKeepaliveSchedule()
+        }
+        if session != nil, activeAutomationScheduleWindow == nil {
+            activeSessionHotspotKeepaliveEnabled = hotspotKeepaliveEnabled
         }
         savePreferences()
         if hotspotKeepaliveEnabled, let hotspotSSID {
@@ -1493,6 +1986,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
         hotspotSSID = ssid
         hotspotKeepaliveEnabled = true
+        if session != nil, activeAutomationScheduleWindow == nil {
+            activeSessionHotspotKeepaliveEnabled = true
+        }
         resetHotspotKeepaliveSchedule()
         savePreferences()
         lastMessage = "Hotspot set to \(ssid)."
@@ -1717,6 +2213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             promptHotspotKeepaliveForNoAjarStart()
         }
         if session != nil {
+            suppressActiveScheduleIfNeeded()
             stopSession()
         }
         startSession(mode: mode, duration: duration, source: .manual, reason: mode.displayName, showErrors: true)
@@ -1746,7 +2243,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         duration: TimeInterval?,
         source: SessionSource,
         reason: String,
-        showErrors: Bool
+        showErrors: Bool,
+        scheduleWindow: NoAjarScheduleWindow? = nil
     ) {
         guard session == nil else { return }
         if source == .automation, mode == .noAjar, !privilegedHelper.isAuthorized {
@@ -1756,6 +2254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
         do {
             let usesNoAjarHelper = mode == .noAjar && privilegedHelper.isAuthorized
+            let effectiveHotspotKeepalive = effectiveHotspotKeepaliveEnabled(mode: mode, scheduleWindow: scheduleWindow)
             let options = LidAwakeOptions(
                 mode: mode,
                 allowBattery: true,
@@ -1764,7 +2263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 durationSeconds: duration,
                 preventDisplaySleep: false,
                 manageLidSleepOverride: !usesNoAjarHelper,
-                hotspotKeepaliveEnabled: hotspotKeepaliveEnabled,
+                hotspotKeepaliveEnabled: effectiveHotspotKeepalive,
                 hotspotSSID: hotspotSSID,
                 reason: "NoAjar \(reason)"
             )
@@ -1778,6 +2277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             activeMode = mode
             activeDurationSeconds = duration
             sessionEndsAt = duration.map { Date().addingTimeInterval($0) }
+            activeAutomationScheduleWindow = source == .automation ? scheduleWindow : nil
+            activeSessionHotspotKeepaliveEnabled = effectiveHotspotKeepalive
             lastMessage = nil
             syncLidBrightness()
             runHotspotKeepalive(showSuccess: false)
@@ -1808,6 +2309,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         sessionSource = nil
         activeMode = nil
         sessionEndsAt = nil
+        activeAutomationScheduleWindow = nil
+        activeSessionHotspotKeepaliveEnabled = false
         resetHotspotKeepaliveSchedule()
         if shouldRestoreBrightness {
             lidBrightnessController.restoreIfNeeded()
@@ -1816,6 +2319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
     private func monitorTick() {
         syncLidBrightness()
+        pruneScheduleSuppressions()
         checkSafety()
         evaluateAutomation()
         rebuildMenu()
@@ -1826,12 +2330,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         runHotspotKeepalive(showSuccess: false)
     }
 
+    private func effectiveHotspotKeepaliveEnabled(
+        mode: AwakeMode,
+        scheduleWindow: NoAjarScheduleWindow?
+    ) -> Bool {
+        if mode == .noAjar,
+           let scheduleWindow,
+           scheduleWindow.rule.mode == .noAjar {
+            return scheduleWindow.rule.keepHotspotConnected
+        }
+        return hotspotKeepaliveEnabled
+    }
+
     private func runHotspotKeepalive(
         showSuccess: Bool,
         requiresActiveSession: Bool = true,
         forceReconnect: Bool = false
     ) {
-        guard hotspotKeepaliveEnabled else {
+        let keepaliveEnabled = requiresActiveSession ? activeSessionHotspotKeepaliveEnabled : hotspotKeepaliveEnabled
+        guard keepaliveEnabled else {
             resetHotspotKeepaliveSchedule()
             return
         }
@@ -1915,7 +2432,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         requiresActiveSession: Bool
     ) {
         hotspotKeepaliveInProgress = false
-        guard hotspotKeepaliveEnabled else {
+        let keepaliveEnabled = requiresActiveSession ? activeSessionHotspotKeepaliveEnabled : hotspotKeepaliveEnabled
+        guard keepaliveEnabled else {
             resetHotspotKeepaliveSchedule()
             return
         }
@@ -2022,36 +2540,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
     private func evaluateAutomation() {
-        if let automationSuppressedUntil, automationSuppressedUntil > Date() {
+        let now = Date()
+        if let automationSuppressedUntil, automationSuppressedUntil > now {
             lastAutomationReasons = []
             return
         }
         automationSuppressedUntil = nil
 
-        let reasons = automationReasons()
-        lastAutomationReasons = reasons
+        let decision = automationDecision(at: now)
+        lastAutomationReasons = decision?.reasons ?? []
 
-        if session == nil, !reasons.isEmpty {
+        if session == nil, let decision {
             startSession(
-                mode: autoAwakeMode,
+                mode: decision.mode,
                 duration: nil,
                 source: .automation,
-                reason: "Automation: \(reasons.joined(separator: ", "))",
-                showErrors: false
+                reason: "Automation: \(decision.reasons.joined(separator: ", "))",
+                showErrors: false,
+                scheduleWindow: decision.scheduleWindow
             )
             return
         }
 
-        if sessionSource == .automation, reasons.isEmpty {
+        guard sessionSource == .automation else { return }
+
+        guard let decision else {
             stopSession()
+            return
+        }
+
+        if activeMode != decision.mode {
+            stopSession()
+            startSession(
+                mode: decision.mode,
+                duration: nil,
+                source: .automation,
+                reason: "Automation: \(decision.reasons.joined(separator: ", "))",
+                showErrors: false,
+                scheduleWindow: decision.scheduleWindow
+            )
+            return
+        }
+
+        activeAutomationScheduleWindow = decision.scheduleWindow
+        syncActiveAutomationHotspotKeepalive(decision)
+    }
+
+    private func automationDecision(at date: Date = Date()) -> AutomationDecision? {
+        var reasons: [String] = []
+        var mode: AwakeMode?
+        let scheduleWindow = activeScheduleWindow(at: date)
+
+        if let scheduleWindow {
+            reasons.append("Schedule")
+            mode = scheduleWindow.rule.mode
+        }
+
+        if autoWatchedApps, isAnyProcessRunning(matching: watchedApps) {
+            reasons.append("App Auto Awake")
+            mode = preferredAutomationMode(mode, autoAwakeMode)
+        }
+
+        guard let mode else { return nil }
+        return AutomationDecision(mode: mode, reasons: reasons, scheduleWindow: scheduleWindow)
+    }
+
+    private func preferredAutomationMode(_ lhs: AwakeMode?, _ rhs: AwakeMode) -> AwakeMode {
+        if lhs == .noAjar || rhs == .noAjar {
+            return .noAjar
+        }
+        return .awake
+    }
+
+    private func syncActiveAutomationHotspotKeepalive(_ decision: AutomationDecision) {
+        let effective = effectiveHotspotKeepaliveEnabled(
+            mode: decision.mode,
+            scheduleWindow: decision.scheduleWindow
+        )
+        guard activeSessionHotspotKeepaliveEnabled != effective else { return }
+        activeSessionHotspotKeepaliveEnabled = effective
+        if effective {
+            runHotspotKeepalive(showSuccess: false)
+        } else {
+            resetHotspotKeepaliveSchedule()
         }
     }
 
-    private func automationReasons() -> [String] {
-        guard autoWatchedApps, isAnyProcessRunning(matching: watchedApps) else {
-            return []
+    private func activeScheduleWindow(at date: Date = Date()) -> NoAjarScheduleWindow? {
+        NoAjarScheduleEvaluator.activeWindow(
+            settings: scheduleSettings,
+            suppressions: scheduleSuppressions,
+            at: date
+        )
+    }
+
+    private func suppressActiveScheduleIfNeeded() {
+        guard sessionSource == .automation,
+              let window = activeAutomationScheduleWindow,
+              Date() < window.end else {
+            return
         }
-        return ["App Auto Awake"]
+
+        scheduleSuppressions.removeAll { $0.ruleID == window.rule.id }
+        scheduleSuppressions.append(NoAjarScheduleSuppression(ruleID: window.rule.id, windowEnd: window.end))
+        scheduleSuppressions = NoAjarScheduleEvaluator.suppressions(scheduleSuppressions, validAt: Date())
+        savePreferences()
+    }
+
+    private func pruneScheduleSuppressions() {
+        let pruned = NoAjarScheduleEvaluator.suppressions(scheduleSuppressions, validAt: Date())
+        guard pruned != scheduleSuppressions else { return }
+        scheduleSuppressions = pruned
+        savePreferences()
     }
 
     private func currentAppVersion() -> String {
@@ -2117,6 +2717,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
 }
+
+private let scheduleWeekdays: [(title: String, fullTitle: String, value: Int)] = [
+    ("Mon", "Monday", 2),
+    ("Tue", "Tuesday", 3),
+    ("Wed", "Wednesday", 4),
+    ("Thu", "Thursday", 5),
+    ("Fri", "Friday", 6),
+    ("Sat", "Saturday", 7),
+    ("Sun", "Sunday", 1)
+]
+
+private let timeFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateStyle = .none
+    formatter.timeStyle = .short
+    return formatter
+}()
+
+private let weekdayFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "EEE"
+    return formatter
+}()
 
 private let durationOptions: [(title: String, seconds: TimeInterval?)] = [
     ("Until Stopped", nil),
@@ -2294,6 +2917,23 @@ private func durationsMatch(_ lhs: TimeInterval?, _ rhs: TimeInterval?) -> Bool 
     default:
         return false
     }
+}
+
+private func dateForMinuteOfDay(_ minute: Int) -> Date {
+    let safeMinute = min(max(minute, 0), 24 * 60 - 1)
+    var components = DateComponents()
+    components.calendar = Calendar.current
+    components.year = 2001
+    components.month = 1
+    components.day = 1
+    components.hour = safeMinute / 60
+    components.minute = safeMinute % 60
+    return components.date ?? Date(timeIntervalSinceReferenceDate: 0)
+}
+
+private func minuteOfDay(from date: Date) -> Int {
+    let components = Calendar.current.dateComponents([.hour, .minute], from: date)
+    return (components.hour ?? 0) * 60 + (components.minute ?? 0)
 }
 
 private func fourCharCode(_ value: String) -> OSType {

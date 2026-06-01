@@ -37,6 +37,10 @@ let package = Package(
         .executableTarget(
             name: "NoAjarHelper",
             dependencies: ["LidAwakeCore"]
+        ),
+        .testTarget(
+            name: "LidAwakeCoreTests",
+            dependencies: ["LidAwakeCore"]
         )
     ]
 )
