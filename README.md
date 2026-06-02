@@ -6,21 +6,25 @@
   <img src="Assets/noajar-icon.png" alt="NoAjar icon" width="220">
 </p>
 
-NoAjar is a small macOS menu bar app for keeping coding agents alive without
-walking around with a MacBook slightly ajar.
+NoAjar is a small macOS menu bar app for keeping local coding agents and
+long-running developer workflows alive.
 
-Use your MacBook with the lid closed.
+It is built for Codex, Claude Code, OpenCode, OpenClaw, SSH sessions,
+background builds, and tests that should keep running even when your Mac would
+normally sleep.
 
-It is built for local-agent workflows such as Codex, Claude Code, OpenCode,
-OpenClaw, SSH, and background build/test work.
+## Release Channels
 
-## Download
+| Channel | Download | Use this when | Current scope |
+| --- | --- | --- | --- |
+| Stable | [Download latest stable](https://github.com/gityeop/NoAjar/releases/latest/download/NoAjar.zip) | You want the recommended public build. | Core Awake Mode, No Ajar Mode, App Auto Awake, duration controls, battery guard, menu UX, Universal 2 build, and one-time beta update checks. |
+| Beta | [Download beta](https://github.com/gityeop/NoAjar/releases/download/beta/NoAjar.zip) | You want to test new features and send feedback. | Everything in stable, plus Keep Hotspot Connected and recurring schedules. |
 
-Download the latest release from GitHub:
+If you already use the stable app, open `Settings` -> `Try Beta Updates` to
+check the beta update feed once. This does not permanently switch the stable
+update channel.
 
-[Download NoAjar.zip](https://github.com/gityeop/NoAjar/releases/latest/download/NoAjar.zip)
-
-Install it:
+## Install
 
 1. Download `NoAjar.zip`.
 2. Unzip it.
@@ -28,7 +32,10 @@ Install it:
 4. Open NoAjar and use the menu bar icon.
 
 When No Ajar Mode is first used, NoAjar installs a small helper for closed-lid
-sleep control, so administrator permission is required.
+sleep control, so administrator permission is required once.
+
+NoAjar requires macOS 13 or later. Current stable and beta builds are Universal
+2 apps for Apple Silicon and Intel Macs.
 
 ## Modes
 
@@ -39,20 +46,26 @@ NoAjar has two user-facing modes:
 | Awake Mode | Keeps the Mac and display awake while the lid is open. This uses normal macOS sleep assertions and does not change lid-close behavior. |
 | No Ajar Mode | Keeps the Mac awake even when the lid is fully closed. This enables `pmset disablesleep 1` while allowing the display to sleep by default. |
 
-The menu bar app keeps the main menu intentionally small:
+No Ajar Mode installs the helper once, then later sessions can start without
+showing an administrator prompt every time.
+
+## Stable Features
+
+The stable menu is organized around the current state, mode selection, duration,
+app automation, and settings.
 
 ```text
-💤
+Status
 
-Awake Mode
 No Ajar Mode
-Turn Off
+Awake Mode
+Duration
+
 Apps
 Settings
+
 Quit
 ```
-
-## Menus
 
 The menu bar title changes by state:
 
@@ -60,74 +73,116 @@ The menu bar title changes by state:
 - `☕`: Awake Mode is active.
 - `🚀`: No Ajar Mode is active.
 
-Awake Mode and No Ajar Mode each include:
+Mode items are toggles. Click the active mode again to stop the current session.
 
-- Start Until Stopped.
-- Start 30 Minutes.
-- Start 1 Hour.
-- Start 4 Hours.
-- Start 8 Hours.
-- Stop Below: select the battery percentage where NoAjar automatically ends the session.
-- Keep Running: keep the session active without battery-percentage auto stop.
+### Duration
 
-Apps includes:
+`Duration` applies to the next manually started mode, and changing it while a
+mode is active restarts that mode with the selected duration.
+
+Duration options:
+
+- Until Stopped
+- 30 Minutes
+- 1 Hour
+- 4 Hours
+- 8 Hours
+- Stop Below: Keep Running, 20%, 30%, 40%, or 50%
+
+### Apps
+
+`Apps` includes:
 
 - App Auto Awake: start automatically while configured app/process names are running.
-- Add Apps: choose `.app` bundles directly instead of typing process names.
+- Add Apps: choose `.app` bundles directly.
 - Clear Apps: remove the watched app list.
 - Mode: choose Awake Mode or No Ajar Mode for App Auto Awake.
+- Apps: shows the current watched app names.
 
-No Ajar Mode installs a helper once, then starts later sessions without showing
-an administrator prompt every time.
+### Settings
 
-Settings includes:
+`Settings` includes:
 
-- Hotkey: opens the NoAjar menu. The default is Cmd-Opt-L and can be changed.
-  Use Set Hotkey to record a shortcut by pressing the keys directly.
+- Hotkey: opens the NoAjar menu. The default is `Cmd-Opt-L`.
+- Hotkey -> Enabled: turns the global hotkey on or off.
+- Hotkey -> Set Hotkey: records a new shortcut by pressing the keys directly.
 - Launch at Login.
-- Check for Updates: opens the update checker.
-- Automatically Check for Updates: checks for updates once per day.
-- Automatically Install Updates: downloads and installs updates in the background when possible.
-- Version: shows the installed app version and build.
+- Check for Updates.
+- Automatically Check for Updates.
+- Automatically Install Updates.
+- Try Beta Updates: checks the beta feed once.
+- Version: shows the installed version and build.
 
-Hotkey menu navigation:
+The hotkey opens the menu only. It does not currently provide `Cmd-1`, `Cmd-2`,
+or number-key shortcuts for selecting menu items.
 
-- Press the configured hotkey to open the menu.
-- Press Cmd-1 for Awake Mode or Cmd-2 for No Ajar Mode.
-- Press 1, 2, 3, 4, or 5 to start Until Stopped, 30 Minutes, 1 Hour, 4 Hours,
-  or 8 Hours.
+## Beta Features
 
-## Build from Source
+The beta channel currently adds Keep Hotspot Connected and recurring schedules.
+These features are still being tested, especially across different Mac models
+and iPhone hotspot conditions.
 
-Build everything:
+### Keep Hotspot Connected
 
-```sh
-make build
-```
+In the beta menu, `Keep Hotspot Connected` appears between `Schedule` and
+`Apps`.
 
-Build the app bundle:
+It includes:
 
-```sh
-make app
-```
+- Keep Hotspot Connected: turns the feature on or off.
+- Hotspot: shows the saved target hotspot name.
+- Use Current Wi-Fi as Hotspot: saves the currently connected Wi-Fi name as the target hotspot and turns the feature on.
+- Forget Hotspot: clears the saved target hotspot.
 
-The app bundle is created at:
+While No Ajar Mode is active, NoAjar can keep checking the saved hotspot and
+ask macOS to reconnect if Wi-Fi drops or moves to another network. If the saved
+hotspot appears only as an Instant Hotspot, the beta uses an experimental macOS
+private API fallback before joining the Wi-Fi network.
 
-```text
-build/NoAjar.app
-```
+This helps with iPhone hotspot interruptions, but it cannot force iOS to
+advertise a hidden or unavailable hotspot.
 
-Run it:
+When a saved hotspot exists and you manually start No Ajar Mode, NoAjar asks
+whether to keep that hotspot connected. Scheduled No Ajar sessions do not show
+that prompt; they use the per-schedule hotspot setting.
 
-```sh
-open build/NoAjar.app
-```
+### Schedule
 
-Remove the helper:
+In the beta menu, `Schedule` appears below `Duration`.
 
-```sh
-make uninstall-helper
-```
+The menu title is:
+
+- `Schedule: Off`
+- `Schedule: 1 Rule`
+- `Schedule: N Rules`
+- `Schedule: Active`
+
+`Schedule` includes:
+
+- Edit Schedules...
+- Active or next schedule summary
+
+The schedule editor supports:
+
+- A global Scheduled Mode checkbox.
+- Multiple enabled or disabled rules.
+- Awake Mode or No Ajar Mode per rule.
+- Weekday selection.
+- Start and end times.
+- Per-rule Hotspot checkbox for No Ajar schedules.
+- Delete rule.
+- Add Rule, Cancel, and Save.
+
+Rules cannot overlap on the same day. Adjacent rules such as `09:00-12:00` and
+`12:00-18:00` are allowed. If an end time is earlier than or equal to the start
+time, the rule is treated as an overnight schedule.
+
+Schedules run only while NoAjar is open. Use `Settings` -> `Launch at Login` if
+you want schedules to work after reboot/login.
+
+If a scheduled session starts and you manually stop it or switch modes, NoAjar
+will not restart that same schedule window until it ends. The next schedule
+window works normally.
 
 ## CLI
 
@@ -163,6 +218,20 @@ Allow battery use, but stop at 40%:
 noajar start --no-ajar --allow-battery --min-battery 40
 ```
 
+Keep the display awake too:
+
+```sh
+noajar start --duration 1h --display-awake
+```
+
+Beta CLI hotspot commands:
+
+```sh
+noajar start --no-ajar --hotspot-keepalive
+noajar start --no-ajar --hotspot-ssid "My iPhone"
+noajar hotspot-keepalive --hotspot-ssid "My iPhone" --force-reconnect
+```
+
 Check state:
 
 ```sh
@@ -173,6 +242,38 @@ Restore normal sleep:
 
 ```sh
 noajar stop
+```
+
+## Build from Source
+
+Build everything:
+
+```sh
+make build
+```
+
+Build the app bundle:
+
+```sh
+make app
+```
+
+The app bundle is created at:
+
+```text
+build/NoAjar.app
+```
+
+Run it:
+
+```sh
+open build/NoAjar.app
+```
+
+Remove the helper:
+
+```sh
+make uninstall-helper
 ```
 
 ## Safety
