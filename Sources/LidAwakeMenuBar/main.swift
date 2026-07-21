@@ -20,6 +20,10 @@ private struct AutomationDecision {
     let scheduleWindow: NoAjarScheduleWindow?
 }
 
+private func usesDarkAppearance(_ appearance: NSAppearance) -> Bool {
+    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+}
+
 private let betaAppcastURLString = "https://github.com/gityeop/NoAjar/releases/download/beta/appcast-beta.xml"
 private let scheduleSettingsDefaultsKey = "scheduleSettings"
 private let scheduleSuppressionsDefaultsKey = "scheduleSuppressions"
@@ -95,7 +99,7 @@ private func performHotspotKeepaliveInHelper(targetSSID: String?, forceReconnect
     }
 
     if process.terminationStatus != 0, let targetSSID {
-        if currentWiFiNetworkName(allowSlowLookup: true) == targetSSID ||
+        if currentHotspotConnectionConfirmsTarget(targetSSID: targetSSID) ||
             (hotspotFailureMayStillComplete(message) && waitForHotspotConnection(targetSSID: targetSSID, timeout: 24)) {
             return HotspotKeepaliveResult(
                 success: true,
@@ -119,6 +123,8 @@ private func hotspotFailureMayStillComplete(_ message: String) -> Bool {
     return normalized.contains("80211api") ||
         normalized.contains("-3900") ||
         normalized.contains("tmperr") ||
+        normalized.contains("did not return wi-fi credentials") ||
+        normalized.contains("did not return wifi credentials") ||
         normalized.contains("wi-fi join failed") ||
         normalized.contains("association")
 }
@@ -126,12 +132,12 @@ private func hotspotFailureMayStillComplete(_ message: String) -> Bool {
 private func waitForHotspotConnection(targetSSID: String, timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        if currentWiFiNetworkName(allowSlowLookup: false) == targetSSID {
+        if currentHotspotConnectionConfirmsTarget(targetSSID: targetSSID) {
             return true
         }
         Thread.sleep(forTimeInterval: 1)
     }
-    return currentWiFiNetworkName(allowSlowLookup: true) == targetSSID
+    return currentHotspotConnectionConfirmsTarget(targetSSID: targetSSID)
 }
 
 private struct HotKeyShortcut {
@@ -148,124 +154,59 @@ private struct HotKeyShortcut {
     )
 }
 
-private final class LidBrightnessController {
-    private typealias GetBrightness = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
-    private typealias SetBrightness = @convention(c) (CGDirectDisplayID, Float) -> Int32
-
-    private static let lidAngleDimThreshold = 20.0
-    private static let lidAngleRestoreThreshold = 25.0
+private final class LidDisplaySleepController {
+    private static let lidAngleSleepThreshold = 20.0
+    private static let lidAngleWakeThreshold = 25.0
     private static let noHIDOptions = IOOptionBits(kIOHIDOptionsTypeNone)
 
-    private let frameworkHandle: UnsafeMutableRawPointer?
-    private let getBrightness: GetBrightness?
-    private let setBrightness: SetBrightness?
-    private var builtInDisplayID: CGDirectDisplayID?
     private var lidAngleDevice: IOHIDDevice?
     private var isLidAngleDeviceOpen = false
     private var lidAngleReport = [UInt8](repeating: 0, count: 8)
-    private var lastOpenBrightness: Float?
-    private var restoreBrightness: Float?
-    private var isDimmed = false
+    private var didRequestDisplaySleep = false
 
     init() {
-        frameworkHandle = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY)
-        if let frameworkHandle,
-           let getSymbol = dlsym(frameworkHandle, "DisplayServicesGetBrightness"),
-           let setSymbol = dlsym(frameworkHandle, "DisplayServicesSetBrightness") {
-            getBrightness = unsafeBitCast(getSymbol, to: GetBrightness.self)
-            setBrightness = unsafeBitCast(setSymbol, to: SetBrightness.self)
-        } else {
-            getBrightness = nil
-            setBrightness = nil
-        }
-        builtInDisplayID = findBuiltInDisplayID()
         lidAngleDevice = findLidAngleDevice()
     }
 
     deinit {
-        restoreIfNeeded()
+        reset()
         closeLidAngleDevice()
-        if let frameworkHandle {
-            dlclose(frameworkHandle)
-        }
     }
 
     func sync(noAjarActive: Bool) {
         guard noAjarActive else {
-            restoreIfNeeded()
-            lastOpenBrightness = nil
+            reset()
             return
         }
 
-        if shouldDimForCurrentLidPosition() {
-            dimIfNeeded()
+        if shouldSleepDisplayForCurrentLidPosition() {
+            requestDisplaySleepIfNeeded()
         } else {
-            restoreIfNeeded()
-            if let brightness = currentBrightness() {
-                lastOpenBrightness = brightness
-            }
+            reset()
         }
     }
 
-    func restoreIfNeeded() {
-        guard isDimmed else { return }
-        if let brightness = restoreBrightness ?? lastOpenBrightness {
-            setBrightnessValue(brightness)
+    func reset() {
+        didRequestDisplaySleep = false
+    }
+
+    private func requestDisplaySleepIfNeeded() {
+        guard !didRequestDisplaySleep else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        process.arguments = ["displaysleepnow"]
+        do {
+            try process.run()
+            didRequestDisplaySleep = true
+        } catch {
+            didRequestDisplaySleep = false
         }
-        restoreBrightness = nil
-        isDimmed = false
     }
 
-    private func dimIfNeeded() {
-        guard !isDimmed else { return }
-        restoreBrightness = lastOpenBrightness ?? currentBrightness()
-        guard setBrightnessValue(0) else { return }
-        isDimmed = true
-    }
-
-    private func currentBrightness() -> Float? {
-        guard let getBrightness,
-              let displayID = usableBuiltInDisplayID() else { return nil }
-
-        var brightness: Float = 0
-        guard getBrightness(displayID, &brightness) == 0 else { return nil }
-        return min(max(brightness, 0), 1)
-    }
-
-    @discardableResult
-    private func setBrightnessValue(_ brightness: Float) -> Bool {
-        guard let setBrightness,
-              let displayID = usableBuiltInDisplayID() else { return false }
-
-        let clamped = min(max(brightness, 0), 1)
-        return setBrightness(displayID, clamped) == 0
-    }
-
-    private func usableBuiltInDisplayID() -> CGDirectDisplayID? {
-        if let displayID = findBuiltInDisplayID() {
-            builtInDisplayID = displayID
-            return displayID
-        }
-        return builtInDisplayID
-    }
-
-    private func findBuiltInDisplayID() -> CGDirectDisplayID? {
-        var count: UInt32 = 0
-        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
-            let mainDisplayID = CGMainDisplayID()
-            return CGDisplayIsBuiltin(mainDisplayID) != 0 ? mainDisplayID : nil
-        }
-
-        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        guard CGGetOnlineDisplayList(count, &displays, &count) == .success else {
-            return nil
-        }
-        return displays.first { CGDisplayIsBuiltin($0) != 0 }
-    }
-
-    private func shouldDimForCurrentLidPosition() -> Bool {
+    private func shouldSleepDisplayForCurrentLidPosition() -> Bool {
         if let angle = currentLidAngle() {
-            let threshold = isDimmed ? Self.lidAngleRestoreThreshold : Self.lidAngleDimThreshold
+            let threshold = didRequestDisplaySleep ? Self.lidAngleWakeThreshold : Self.lidAngleSleepThreshold
             return angle <= threshold
         }
         return isLidClosed()
@@ -710,7 +651,12 @@ private final class WeekdayPillButton: NSButton {
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: 54, height: 30)
+        NSSize(width: 44, height: 28)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateStyle()
     }
 
     override func resetCursorRects() {
@@ -723,36 +669,215 @@ private final class WeekdayPillButton: NSButton {
     }
 
     private func updateStyle() {
+        let dark = usesDarkAppearance(effectiveAppearance)
         layer?.cornerRadius = 8
         layer?.backgroundColor = isOn
             ? NSColor.controlAccentColor.cgColor
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.95).cgColor
+            : (dark ? NSColor(calibratedWhite: 0.24, alpha: 1) : NSColor(calibratedWhite: 0.9, alpha: 1)).cgColor
         attributedTitle = NSAttributedString(
             string: title,
             attributes: [
                 .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: isOn ? NSColor.white : NSColor.labelColor
+                .foregroundColor: isOn ? NSColor.white : (dark ? NSColor.white.withAlphaComponent(0.92) : NSColor.labelColor)
             ]
         )
     }
 }
 
-private final class ScheduleRuleEditorRow: NSView {
+private final class NetworkSuggestionButton: NSButton {
+    let networkName: String
+
+    init(networkName: String) {
+        self.networkName = networkName
+        super.init(frame: .zero)
+        title = networkName
+        bezelStyle = .regularSquare
+        isBordered = false
+        alignment = .left
+        lineBreakMode = .byTruncatingTail
+        toolTip = networkName
+        setAccessibilityLabel(networkName)
+        wantsLayer = true
+        updateStyle()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 320, height: 24)
+    }
+
+    override var isHighlighted: Bool {
+        didSet {
+            updateStyle()
+        }
+    }
+
+    private func updateStyle() {
+        layer?.cornerRadius = 5
+        layer?.backgroundColor = isHighlighted
+            ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.18).cgColor
+            : NSColor.clear.cgColor
+        attributedTitle = NSAttributedString(
+            string: "  \(networkName)",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+    }
+}
+
+private final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class CompactTimeField: NSTextField, NSTextFieldDelegate {
+    var onCompactTimeChange: (() -> Void)?
+    private var isApplyingCompactTime = false
+    private var minuteOfDayValueStorage = 0
+
+    var minuteOfDayValue: Int {
+        get {
+            minuteOfDayValueStorage
+        }
+        set {
+            setMinuteOfDayValue(newValue, notify: false)
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    private func setup() {
+        delegate = self
+        alignment = .center
+        lineBreakMode = .byClipping
+        isContinuous = true
+        focusRingType = .default
+        toolTip = "Enter time as HH:mm or 1730"
+    }
+
+    func commitPendingInput() {
+        applyCompactTimeInput(acceptsThreeDigitInput: true, notify: false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        selectText(nil)
+        clearTextForMouseInput()
+        clearTextForMouseInputOnNextRunLoop()
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard obj.object as? CompactTimeField === self else {
+            return
+        }
+        normalizeTimeInputAfterEdit()
+        applyCompactTimeInput(acceptsThreeDigitInput: false, notify: true)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard obj.object as? CompactTimeField === self else {
+            return
+        }
+        applyCompactTimeInput(acceptsThreeDigitInput: true, notify: true)
+    }
+
+    private func applyCompactTimeInput(acceptsThreeDigitInput: Bool, notify: Bool) {
+        guard !isApplyingCompactTime else { return }
+
+        guard let minute = minuteOfDayFromTimeInput(
+            currentEditor()?.string ?? stringValue,
+            acceptsThreeDigitInput: acceptsThreeDigitInput
+        ) else {
+            if acceptsThreeDigitInput {
+                setMinuteOfDayValue(minuteOfDayValueStorage, notify: false)
+            }
+            return
+        }
+        setMinuteOfDayValue(minute, notify: notify)
+    }
+
+    private func setMinuteOfDayValue(_ minute: Int, notify: Bool) {
+        let safeMinute = min(max(minute, 0), 24 * 60 - 1)
+        guard minuteOfDayValueStorage != safeMinute || stringValue != compactTimeDisplayString(safeMinute) else {
+            return
+        }
+
+        isApplyingCompactTime = true
+        minuteOfDayValueStorage = safeMinute
+        stringValue = compactTimeDisplayString(safeMinute)
+        currentEditor()?.string = stringValue
+        isApplyingCompactTime = false
+        if notify {
+            onCompactTimeChange?()
+        }
+    }
+
+    private func clearTextForMouseInput() {
+        isApplyingCompactTime = true
+        stringValue = ""
+        currentEditor()?.string = ""
+        isApplyingCompactTime = false
+    }
+
+    private func normalizeTimeInputAfterEdit() {
+        let raw = currentEditor()?.string ?? stringValue
+        let normalized = normalizedTimeInputString(raw)
+        guard normalized != raw else { return }
+
+        isApplyingCompactTime = true
+        stringValue = normalized
+        if let editor = currentEditor() {
+            editor.string = normalized
+            editor.selectedRange = NSRange(location: normalized.count, length: 0)
+        }
+        isApplyingCompactTime = false
+    }
+
+    private func clearTextForMouseInputOnNextRunLoop() {
+        DispatchQueue.main.async { [weak self] in
+            self?.clearTextForMouseInput()
+        }
+    }
+}
+
+private final class ScheduleRuleEditorRow: NSView, NSSearchFieldDelegate {
     var onChange: (() -> Void)?
     var onDelete: ((ScheduleRuleEditorRow) -> Void)?
+    var onHeightChange: (() -> Void)?
 
     private let enabledButton = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
     private let modeControl = NSSegmentedControl(labels: ["Awake", "No Ajar"], trackingMode: .selectOne, target: nil, action: nil)
-    private let keepHotspotButton = NSButton(checkboxWithTitle: "Hotspot", target: nil, action: nil)
-    private let startPicker = NSDatePicker()
-    private let endPicker = NSDatePicker()
+    private let networkButton = NSButton(checkboxWithTitle: "Network", target: nil, action: nil)
+    private let networkField = NSSearchField()
+    private let networkSuggestionsStack = NSStackView()
+    private let startPicker = CompactTimeField()
+    private let endPicker = CompactTimeField()
     private let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
     private var weekdayButtons: [(value: Int, button: WeekdayPillButton)] = []
+    private var networkSuggestions: [String]
+    private var filteredNetworkSuggestions: [String]
+    private let defaultNetworkSSID: String?
     private let ruleID: String
+    private var suggestionsVisible = false
 
-    init(rule: NoAjarScheduleRule) {
+    init(rule: NoAjarScheduleRule, networkSuggestions: [String], defaultNetworkSSID: String?) {
         ruleID = rule.id
-        super.init(frame: NSRect(x: 0, y: 0, width: 680, height: 110))
+        self.networkSuggestions = uniqueNetworkNames(networkSuggestions)
+        self.filteredNetworkSuggestions = self.networkSuggestions
+        self.defaultNetworkSSID = defaultNetworkSSID
+        super.init(frame: NSRect(x: 0, y: 0, width: scheduleRuleRowWidth, height: compactScheduleRuleRowHeight))
         setupView(rule: rule)
     }
 
@@ -760,21 +885,64 @@ private final class ScheduleRuleEditorRow: NSView {
         nil
     }
 
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: scheduleRuleRowWidth, height: preferredHeight)
+    }
+
+    var preferredHeight: CGFloat {
+        suggestionsVisible ? expandedScheduleRuleRowHeight : compactScheduleRuleRowHeight
+    }
+
     func rule() -> NoAjarScheduleRule {
+        startPicker.commitPendingInput()
+        endPicker.commitPendingInput()
         let mode: AwakeMode = modeControl.selectedSegment == 1 ? .noAjar : .awake
+        let networkSSID = networkField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        let shouldConnectNetwork = networkButton.state == .on
+        let resolvedNetworkSSID = networkSSID ?? defaultNetworkSSID
         return NoAjarScheduleRule(
             id: ruleID,
             enabled: enabledButton.state == .on,
             mode: mode,
-            keepHotspotConnected: mode == .noAjar && keepHotspotButton.state == .on,
+            keepHotspotConnected: shouldConnectNetwork,
+            networkSSID: shouldConnectNetwork ? resolvedNetworkSSID : nil,
             weekdays: selectedWeekdays(),
-            startMinute: minuteOfDay(from: startPicker.dateValue),
-            endMinute: minuteOfDay(from: endPicker.dateValue)
+            startMinute: startPicker.minuteOfDayValue,
+            endMinute: endPicker.minuteOfDayValue
         )
     }
 
+    func hasValidNetworkTarget() -> Bool {
+        guard networkButton.state == .on else { return true }
+        let enteredSSID = networkField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        return enteredSSID != nil || defaultNetworkSSID != nil
+    }
+
+    func setNetworkSuggestions(_ suggestions: [String]) {
+        networkSuggestions = uniqueNetworkNames(suggestions)
+        updateFilteredNetworkSuggestions()
+    }
+
+    var keyViews: [NSView] {
+        [enabledButton, modeControl, startPicker, endPicker] +
+            weekdayButtons.map(\.button) +
+            [networkButton, networkField, deleteButton]
+    }
+
     @objc private func controlChanged() {
-        updateHotspotControlState()
+        updateNetworkControlState()
+        onChange?()
+    }
+
+    @objc private func networkButtonChanged() {
+        if networkButton.state == .off {
+            networkField.stringValue = ""
+        }
+        updateNetworkControlState()
         onChange?()
     }
 
@@ -782,10 +950,25 @@ private final class ScheduleRuleEditorRow: NSView {
         onDelete?(self)
     }
 
+    @objc private func networkSuggestionClicked(_ sender: NetworkSuggestionButton) {
+        networkField.stringValue = sender.networkName
+        networkButton.state = .on
+        updateNetworkControlState()
+        onChange?()
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard obj.object as? NSSearchField === networkField else { return }
+        if !networkField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            networkButton.state = .on
+        }
+        updateNetworkControlState()
+        onChange?()
+    }
+
     private func setupView(rule: NoAjarScheduleRule) {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.35).cgColor
-        layer?.cornerRadius = 8
+        updateStyle()
 
         enabledButton.target = self
         enabledButton.action = #selector(controlChanged)
@@ -797,11 +980,22 @@ private final class ScheduleRuleEditorRow: NSView {
         modeControl.setWidth(74, forSegment: 0)
         modeControl.setWidth(84, forSegment: 1)
 
-        keepHotspotButton.target = self
-        keepHotspotButton.action = #selector(controlChanged)
-        keepHotspotButton.state = rule.keepHotspotConnected ? .on : .off
-        keepHotspotButton.toolTip = "Keep the saved hotspot connected while this schedule is running."
-        updateHotspotControlState()
+        networkButton.target = self
+        networkButton.action = #selector(networkButtonChanged)
+        networkButton.state = (rule.keepHotspotConnected || rule.networkSSID != nil) ? .on : .off
+        networkButton.toolTip = "Connect to the selected Wi-Fi or hotspot while this schedule is running."
+
+        networkField.delegate = self
+        networkField.target = self
+        networkField.action = #selector(controlChanged)
+        networkField.placeholderString = defaultNetworkSSID.map { "Saved: \($0)" } ?? "Search saved Wi-Fi or hotspot"
+        networkField.stringValue = rule.networkSSID ?? ""
+        networkField.font = .systemFont(ofSize: 12)
+        networkField.sendsSearchStringImmediately = true
+        networkSuggestionsStack.orientation = .vertical
+        networkSuggestionsStack.alignment = .leading
+        networkSuggestionsStack.spacing = 2
+        updateNetworkControlState()
 
         configureTimePicker(startPicker, minute: rule.startMinute)
         configureTimePicker(endPicker, minute: rule.endMinute)
@@ -836,48 +1030,137 @@ private final class ScheduleRuleEditorRow: NSView {
             dayStack.addArrangedSubview(button)
         }
 
-        let bottomStack = NSStackView(views: [dayStack, keepHotspotButton])
-        bottomStack.orientation = .horizontal
-        bottomStack.alignment = .centerY
-        bottomStack.spacing = 14
+        let networkFieldStack = NSStackView(views: [networkField, networkSuggestionsStack])
+        networkFieldStack.orientation = .vertical
+        networkFieldStack.alignment = .leading
+        networkFieldStack.spacing = 2
 
-        let stack = NSStackView(views: [topStack, bottomStack])
+        let networkRow = NSStackView(views: [networkButton, networkFieldStack])
+        networkRow.orientation = .horizontal
+        networkRow.alignment = .top
+        networkRow.spacing = 8
+
+        let stack = NSStackView(views: [topStack, dayStack, networkRow])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
-            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8),
             modeControl.widthAnchor.constraint(equalToConstant: 164),
             startPicker.widthAnchor.constraint(equalToConstant: 86),
-            endPicker.widthAnchor.constraint(equalToConstant: 86)
+            endPicker.widthAnchor.constraint(equalToConstant: 86),
+            networkField.widthAnchor.constraint(equalToConstant: 320)
         ])
     }
 
-    private func updateHotspotControlState() {
-        let noAjarSelected = modeControl.selectedSegment == 1
-        keepHotspotButton.isEnabled = noAjarSelected
-        if !noAjarSelected {
-            keepHotspotButton.state = .off
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateStyle()
+    }
+
+    private func updateStyle() {
+        let dark = usesDarkAppearance(effectiveAppearance)
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+        layer?.borderColor = (dark
+            ? NSColor.white.withAlphaComponent(0.08)
+            : NSColor.black.withAlphaComponent(0.08)).cgColor
+        layer?.backgroundColor = (dark
+            ? NSColor(calibratedWhite: 0.16, alpha: 1)
+            : NSColor(calibratedWhite: 0.97, alpha: 1)).cgColor
+    }
+
+    private func updateNetworkControlState() {
+        networkButton.isEnabled = true
+        networkField.isEnabled = true
+        updateFilteredNetworkSuggestions()
+    }
+
+    private func updateFilteredNetworkSuggestions() {
+        let query = networkField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        filteredNetworkSuggestions = matchingNetworkSuggestions(query: query)
+        updateNetworkSuggestionButtons()
+    }
+
+    private func matchingNetworkSuggestions(query: String) -> [String] {
+        let normalizedQuery = normalizedNetworkSearchKey(query)
+        guard !normalizedQuery.isEmpty else { return networkSuggestions }
+
+        return networkSuggestions.compactMap { name -> (name: String, score: Int)? in
+            guard let score = networkMatchScore(name: name, normalizedQuery: normalizedQuery) else {
+                return nil
+            }
+            return (name, score)
         }
+        .sorted { lhs, rhs in
+            if lhs.score != rhs.score {
+                return lhs.score < rhs.score
+            }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+        .map(\.name)
+    }
+
+    private func updateNetworkSuggestionButtons() {
+        networkSuggestionsStack.arrangedSubviews.forEach { view in
+            networkSuggestionsStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        let query = networkField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            setNetworkSuggestionsVisible(false)
+            return
+        }
+
+        let normalizedQuery = normalizedNetworkSearchKey(query)
+        let hasExactMatch = networkSuggestions.contains {
+            normalizedNetworkSearchKey($0) == normalizedQuery
+        }
+        guard !hasExactMatch else {
+            setNetworkSuggestionsVisible(false)
+            return
+        }
+
+        let matches = filteredNetworkSuggestions.prefix(1)
+        setNetworkSuggestionsVisible(!matches.isEmpty)
+        for name in matches {
+            let button = NetworkSuggestionButton(networkName: name)
+            button.target = self
+            button.action = #selector(networkSuggestionClicked(_:))
+            networkSuggestionsStack.addArrangedSubview(button)
+        }
+    }
+
+    private func setNetworkSuggestionsVisible(_ visible: Bool) {
+        guard suggestionsVisible != visible else {
+            networkSuggestionsStack.isHidden = !visible
+            return
+        }
+
+        suggestionsVisible = visible
+        networkSuggestionsStack.isHidden = !visible
+        invalidateIntrinsicContentSize()
+        superview?.needsLayout = true
+        onHeightChange?()
     }
 
     private func selectedWeekdays() -> [Int] {
         weekdayButtons.compactMap { $0.button.isOn ? $0.value : nil }
     }
 
-    private func configureTimePicker(_ picker: NSDatePicker, minute: Int) {
-        picker.datePickerMode = .single
-        picker.datePickerStyle = .textFieldAndStepper
-        picker.datePickerElements = [.hourMinute]
-        picker.dateValue = dateForMinuteOfDay(minute)
-        picker.target = self
-        picker.action = #selector(controlChanged)
+    private func configureTimePicker(_ picker: CompactTimeField, minute: Int) {
+        picker.minuteOfDayValue = minute
         picker.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        picker.onCompactTimeChange = { [weak self] in
+            self?.controlChanged()
+        }
     }
 
     private func label(_ title: String) -> NSTextField {
@@ -893,26 +1176,42 @@ private final class ScheduleEditorController: NSObject {
     private let panel: NSPanel
     private let enabledButton = NSButton(checkboxWithTitle: "Scheduled Mode", target: nil, action: nil)
     private let rowsStack = NSStackView()
-    private let rowsDocumentView = NSView(frame: NSRect(x: 0, y: 0, width: 688, height: 285))
+    private let rowsDocumentView = FlippedDocumentView(
+        frame: NSRect(x: 0, y: 0, width: scheduleRuleRowWidth, height: scheduleRowsScrollHeight)
+    )
     private let errorLabel = NSTextField(labelWithString: "")
+    private let addButton = NSButton(title: "Add Rule", target: nil, action: nil)
+    private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
+    private let defaultNetworkSSID: String?
     private var rows: [ScheduleRuleEditorRow] = []
+    private var networkSuggestions: [String]
     private var result: NoAjarScheduleSettings?
 
-    init(settings: NoAjarScheduleSettings) {
+    init(
+        settings: NoAjarScheduleSettings,
+        defaultNetworkSSID: String?,
+        initialNetworkSuggestions: [String]
+    ) {
+        self.defaultNetworkSSID = defaultNetworkSSID
+        self.networkSuggestions = uniqueNetworkNames(initialNetworkSuggestions)
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 580),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         super.init()
         setupPanel(settings: settings)
+        refreshNetworkSuggestions()
     }
 
     func run() -> NoAjarScheduleSettings? {
         panel.center()
         panel.makeKeyAndOrderFront(nil)
+        if let firstKeyView = rows.first?.keyViews.first {
+            panel.makeFirstResponder(firstKeyView)
+        }
         NSApp.runModal(for: panel)
         panel.orderOut(nil)
         return result
@@ -962,7 +1261,7 @@ private final class ScheduleEditorController: NSObject {
 
         rowsStack.orientation = .vertical
         rowsStack.alignment = .leading
-        rowsStack.spacing = 10
+        rowsStack.spacing = 8
         rowsStack.translatesAutoresizingMaskIntoConstraints = false
 
         rowsDocumentView.addSubview(rowsStack)
@@ -978,9 +1277,11 @@ private final class ScheduleEditorController: NSObject {
         scrollView.borderType = .noBorder
         scrollView.documentView = rowsDocumentView
 
-        let addButton = NSButton(title: "Add Rule", target: self, action: #selector(addRule))
+        addButton.target = self
+        addButton.action = #selector(addRule)
         addButton.bezelStyle = .rounded
-        let cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancelButton.target = self
+        cancelButton.action = #selector(cancel)
         cancelButton.bezelStyle = .rounded
         saveButton.target = self
         saveButton.action = #selector(save)
@@ -1012,26 +1313,34 @@ private final class ScheduleEditorController: NSObject {
             stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
             scrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scrollView.heightAnchor.constraint(equalToConstant: 285),
+            scrollView.heightAnchor.constraint(equalToConstant: scheduleRowsScrollHeight),
             buttonStack.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
 
         let initialRules = settings.rules.isEmpty ? [NoAjarScheduleRule()] : settings.rules
         initialRules.forEach(appendRow)
+        updateKeyViewLoop()
         validate()
     }
 
     private func appendRow(_ rule: NoAjarScheduleRule) {
-        let row = ScheduleRuleEditorRow(rule: rule)
+        let row = ScheduleRuleEditorRow(
+            rule: rule,
+            networkSuggestions: networkSuggestions,
+            defaultNetworkSSID: defaultNetworkSSID
+        )
         row.onChange = { [weak self] in self?.validate() }
         row.onDelete = { [weak self] row in
             self?.removeRow(row)
         }
+        row.onHeightChange = { [weak self] in
+            self?.updateRowsDocumentFrame()
+        }
         rows.append(row)
         rowsStack.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalToConstant: 688).isActive = true
-        row.heightAnchor.constraint(equalToConstant: 110).isActive = true
+        row.widthAnchor.constraint(equalToConstant: scheduleRuleRowWidth).isActive = true
         updateRowsDocumentFrame()
+        updateKeyViewLoop()
     }
 
     private func removeRow(_ row: ScheduleRuleEditorRow) {
@@ -1039,16 +1348,56 @@ private final class ScheduleEditorController: NSObject {
         rowsStack.removeArrangedSubview(row)
         row.removeFromSuperview()
         updateRowsDocumentFrame()
+        updateKeyViewLoop()
         validate()
     }
 
     private func updateRowsDocumentFrame() {
-        let height = max(285, CGFloat(rows.count) * 120)
-        rowsDocumentView.setFrameSize(NSSize(width: 688, height: height))
+        let rowsHeight = rows.reduce(CGFloat(0)) { $0 + $1.preferredHeight }
+        let spacingHeight = max(0, CGFloat(rows.count - 1)) * rowsStack.spacing
+        let height = max(scheduleRowsScrollHeight, rowsHeight + spacingHeight)
+        rowsDocumentView.setFrameSize(NSSize(width: scheduleRuleRowWidth, height: height))
+        rowsDocumentView.needsLayout = true
+    }
+
+    private func updateKeyViewLoop() {
+        let keyViews = [enabledButton] +
+            rows.flatMap(\.keyViews) +
+            [addButton, cancelButton, saveButton]
+        guard !keyViews.isEmpty else { return }
+
+        for (index, view) in keyViews.enumerated() {
+            view.nextKeyView = keyViews[(index + 1) % keyViews.count]
+        }
+        panel.contentView?.nextKeyView = keyViews.first
+        panel.initialFirstResponder = keyViews.first
+    }
+
+    private func refreshNetworkSuggestions() {
+        Task.detached(priority: .utility) { [weak self, networkSuggestions] in
+            let saved = uniqueNetworkNames(networkSuggestions + savedWiFiNetworkNames())
+            await MainActor.run {
+                guard let self else { return }
+                self.networkSuggestions = saved
+                self.rows.forEach { $0.setNetworkSuggestions(saved) }
+            }
+
+            let refreshed = uniqueNetworkNames(saved + availableWiFiNetworkNames())
+            await MainActor.run {
+                guard let self else { return }
+                self.networkSuggestions = refreshed
+                self.rows.forEach { $0.setNetworkSuggestions(refreshed) }
+            }
+        }
     }
 
     private func validate() {
         let rules = rows.map { $0.rule() }
+        if rows.contains(where: { !$0.hasValidNetworkTarget() }) {
+            saveButton.isEnabled = false
+            errorLabel.stringValue = "Enter a Wi-Fi or hotspot name for each Network rule."
+            return
+        }
         if let emptyWeekdayRule = rules.first(where: { $0.enabled && $0.normalizedWeekdays.isEmpty }) {
             saveButton.isEnabled = false
             errorLabel.stringValue = "Choose at least one day for each enabled rule. Rule \(emptyWeekdayRule.id.prefix(4)) has no days."
@@ -1136,30 +1485,88 @@ private final class HotKeyController: @unchecked Sendable {
     }
 }
 
+private struct PrivilegedNoAjarHelperStatus {
+    let isManaged: Bool
+    let isSleepDisabled: Bool
+}
+
 private final class PrivilegedNoAjarHelperClient {
     private enum Command {
         case enable
         case disable
-        case status
     }
 
     var isAuthorized: Bool {
-        (try? send(.status)) != nil
+        (try? status()) != nil
     }
 
     func authorize(appBundleURL: URL) throws {
         if isAuthorized { return }
         try install(appBundleURL: appBundleURL)
         let deadline = Date().addingTimeInterval(5)
+        var lastError: Error?
         while Date() < deadline {
-            if isAuthorized { return }
+            do {
+                _ = try status()
+                return
+            } catch {
+                lastError = error
+            }
             Thread.sleep(forTimeInterval: 0.2)
+        }
+        if let lastError {
+            throw lastError
         }
         throw LidAwakeError("Privileged helper was installed, but did not start.")
     }
 
     func setNoAjarActive(_ active: Bool) throws {
         try send(active ? .enable : .disable)
+    }
+
+    func status() throws -> PrivilegedNoAjarHelperStatus {
+        let connection = NSXPCConnection(machServiceName: noAjarHelperLabel, options: .privileged)
+        connection.remoteObjectInterface = NSXPCInterface(with: NoAjarHelperProtocol.self)
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var response: PrivilegedNoAjarHelperStatus?
+        var responseError: Error?
+
+        connection.resume()
+        let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+            responseError = error
+            semaphore.signal()
+        } as? NoAjarHelperProtocol
+
+        guard let proxy else {
+            connection.invalidate()
+            throw LidAwakeError("Privileged helper connection failed.")
+        }
+
+        proxy.statusV2 { isManaged, isSleepDisabled, message in
+            if let message {
+                responseError = LidAwakeError(message as String)
+            } else {
+                response = PrivilegedNoAjarHelperStatus(
+                    isManaged: isManaged,
+                    isSleepDisabled: isSleepDisabled
+                )
+            }
+            semaphore.signal()
+        }
+
+        guard semaphore.wait(timeout: .now() + 5) == .success else {
+            connection.invalidate()
+            throw LidAwakeError("Privileged helper did not respond.")
+        }
+        connection.invalidate()
+        if let responseError {
+            throw responseError
+        }
+        guard let response else {
+            throw LidAwakeError("Privileged helper returned no status.")
+        }
+        return response
     }
 
     private func send(_ command: Command) throws {
@@ -1183,7 +1590,7 @@ private final class PrivilegedNoAjarHelperClient {
         let reply: (Bool, NSString?) -> Void = { ok, message in
             if let message {
                 responseError = LidAwakeError(message as String)
-            } else if command != .status, !ok {
+            } else if !ok {
                 responseError = LidAwakeError("Privileged helper command failed.")
             }
             semaphore.signal()
@@ -1194,8 +1601,6 @@ private final class PrivilegedNoAjarHelperClient {
             proxy.enableNoAjar(withReply: reply)
         case .disable:
             proxy.disableNoAjar(withReply: reply)
-        case .status:
-            proxy.status(withReply: reply)
         }
 
         guard semaphore.wait(timeout: .now() + 5) == .success else {
@@ -1314,15 +1719,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private let menu = NSMenu()
     private let launchAgent = LaunchAgent(label: "dev.local.noajar")
     private let privilegedHelper = PrivilegedNoAjarHelperClient()
-    private let lidBrightnessController = LidBrightnessController()
+    private let lidDisplaySleepController = LidDisplaySleepController()
 
     private var session: LidAwakeSession?
     private var sessionSource: SessionSource?
     private var activeMode: AwakeMode?
+    private var helperManagedNoAjarState = false
     private var activeDurationSeconds: TimeInterval?
     private var sessionEndsAt: Date?
     private var monitorTimer: Timer?
-    private var lidBrightnessTimer: Timer?
+    private var lidDisplaySleepTimer: Timer?
     private var hotspotKeepaliveTimer: Timer?
     private var hotKeyController: HotKeyController?
     private var isRecordingHotKey = false
@@ -1332,11 +1738,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private var hotspotKeepaliveEnabled = false
     private var hotspotSSID: String?
     private var activeSessionHotspotKeepaliveEnabled = false
+    private var activeSessionHotspotSSID: String?
     private var hotspotKeepaliveInProgress = false
     private var hotspotKeepaliveFailureCount = 0
     private var lastHotspotConnectionConfirmedAt: Date?
+    private var lastHotspotConnectionTargetSSID: String?
     private var scheduleSettings = NoAjarScheduleSettings()
-    private var scheduleSuppressions: [NoAjarScheduleSuppression] = []
     private var autoWatchedApps = false
     private var autoAwakeMode = AwakeMode.awake
     private var hotKeyEnabled = true
@@ -1346,6 +1753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private var lastAutomationReasons: [String] = []
     private var lastMessage: String?
     private var isMenuOpen = false
+    private var menuRefreshPending = false
     private var lastHotKeyActivationAt: Date?
     private var automationSuppressedUntil: Date?
     private var activeAutomationScheduleWindow: NoAjarScheduleWindow?
@@ -1354,8 +1762,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem.button?.title = "NoAjar"
-        repairStaleStateIfNeeded()
+        do {
+            try repairStaleStateIfNeeded()
+        } catch {
+            lastMessage = error.localizedDescription
+        }
         loadPreferences()
+        reconcilePrivilegedHelperStateOnLaunch()
         menu.delegate = self
         setupSparkleUpdater()
         setupHotKey()
@@ -1364,20 +1777,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 self?.monitorTick()
             }
         }
-        lidBrightnessTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        lidDisplaySleepTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.syncLidBrightness()
+                self?.syncLidDisplaySleep()
             }
         }
         monitorTick()
     }
 
+    private func reconcilePrivilegedHelperStateOnLaunch() {
+        guard FileManager.default.fileExists(atPath: noAjarHelperToolURL.path) else { return }
+
+        do {
+            let status = try privilegedHelper.status()
+            helperManagedNoAjarState = status.isManaged
+            guard status.isManaged else { return }
+            _ = stopSession()
+        } catch {
+            lastMessage = error.localizedDescription
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         monitorTimer?.invalidate()
-        lidBrightnessTimer?.invalidate()
+        lidDisplaySleepTimer?.invalidate()
         hotspotKeepaliveTimer?.invalidate()
         stopSession()
-        lidBrightnessController.restoreIfNeeded()
+        lidDisplaySleepController.reset()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -1386,6 +1812,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
     func menuDidClose(_ menu: NSMenu) {
         isMenuOpen = false
+        if menuRefreshPending {
+            rebuildMenu()
+        }
         lastHotKeyActivationAt = Date()
     }
 
@@ -1410,10 +1839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
            let decoded = try? JSONDecoder().decode(NoAjarScheduleSettings.self, from: data) {
             scheduleSettings = decoded
         }
-        if let data = defaults.data(forKey: scheduleSuppressionsDefaultsKey),
-           let decoded = try? JSONDecoder().decode([NoAjarScheduleSuppression].self, from: data) {
-            scheduleSuppressions = NoAjarScheduleEvaluator.suppressions(decoded, validAt: Date())
-        }
+        defaults.removeObject(forKey: scheduleSuppressionsDefaultsKey)
         if let storedApps = defaults.stringArray(forKey: "watchedApps") {
             watchedApps = storedApps
         }
@@ -1440,12 +1866,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         if let data = try? JSONEncoder().encode(scheduleSettings) {
             defaults.set(data, forKey: scheduleSettingsDefaultsKey)
         }
-        if let data = try? JSONEncoder().encode(scheduleSuppressions) {
-            defaults.set(data, forKey: scheduleSuppressionsDefaultsKey)
-        }
+        defaults.removeObject(forKey: scheduleSuppressionsDefaultsKey)
     }
 
     private func rebuildMenu() {
+        guard !isMenuOpen else {
+            menuRefreshPending = true
+            return
+        }
+        menuRefreshPending = false
         menu.removeAllItems()
         menu.autoenablesItems = false
 
@@ -1512,6 +1941,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             ("Power: \(power)", .systemFont(ofSize: 13, weight: .regular), .labelColor)
         ]
 
+        if let scheduleStatus = dashboardScheduleStatus() {
+            rows.append((
+                scheduleStatus,
+                .systemFont(ofSize: 13, weight: .regular),
+                .labelColor
+            ))
+        }
         if !lastAutomationReasons.isEmpty {
             rows.append((
                 "Trigger: \(lastAutomationReasons.joined(separator: ", "))",
@@ -1519,17 +1955,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 .labelColor
             ))
         }
-        if let lastMessage {
+        if let lastMessage = dashboardLastMessage {
             rows.append((
                 lastMessage,
                 .systemFont(ofSize: 13, weight: .medium),
                 .systemOrange
             ))
         }
-        if displayedHotspotKeepaliveEnabled {
-            let target = hotspotSSID.map { " -> \($0)" } ?? ""
+        if dashboardHotspotKeepaliveEnabled {
+            let target = dashboardHotspotSSID.map { " -> \($0)" } ?? ""
             rows.append((
-                "Keep Hotspot Connected: On\(target)",
+                "Keep Network Connected: On\(target)",
                 .systemFont(ofSize: 13, weight: .regular),
                 .secondaryLabelColor
             ))
@@ -1538,10 +1974,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
     private var displayedHotspotKeepaliveEnabled: Bool {
-        session == nil ? hotspotKeepaliveEnabled : activeSessionHotspotKeepaliveEnabled
+        if session != nil {
+            return activeSessionHotspotKeepaliveEnabled
+        }
+        if let scheduleWindow = activeScheduleWindow() {
+            return scheduleWindow.rule.keepHotspotConnected
+        }
+        return hotspotKeepaliveEnabled
+    }
+
+    private var displayedHotspotSSID: String? {
+        if session != nil {
+            return activeSessionHotspotSSID
+        }
+        if let scheduleWindow = activeScheduleWindow(),
+           scheduleWindow.rule.keepHotspotConnected {
+            return scheduleWindow.rule.networkSSID ?? hotspotSSID
+        }
+        return hotspotSSID
+    }
+
+    private var dashboardHotspotKeepaliveEnabled: Bool {
+        session != nil && activeSessionHotspotKeepaliveEnabled
+    }
+
+    private var dashboardHotspotSSID: String? {
+        guard dashboardHotspotKeepaliveEnabled else { return nil }
+        return activeSessionHotspotSSID
+    }
+
+    private var dashboardLastMessage: String? {
+        guard let lastMessage else { return nil }
+        if session == nil, isTransientNetworkMessage(lastMessage) {
+            return nil
+        }
+        return lastMessage
+    }
+
+    private func isTransientNetworkMessage(_ message: String) -> Bool {
+        message.hasPrefix("Connected to ") ||
+            message.hasPrefix("Connecting to ") ||
+            message.hasPrefix("Keep Hotspot Connected enabled") ||
+            message == "Keep Hotspot Connected disabled." ||
+            message.hasPrefix("Hotspot set to ") ||
+            message == "Hotspot forgotten."
     }
 
     private func menuBarStatusTitle() -> String {
+        if scheduleDrivenNoAjarSessionActive || helperManagedNoAjarState {
+            return "🚀"
+        }
         guard let activeMode else {
             return "💤"
         }
@@ -1555,12 +2037,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
     private func statusTitle() -> String {
+        if activeMode == nil, helperManagedNoAjarState {
+            return "No Ajar Mode, restore needed"
+        }
         guard let activeMode else {
             return "Off"
         }
 
-        let source = sessionSource == .automation ? "Auto" : "Manual"
+        let source = activeSessionSourceTitle()
         return "\(activeMode.displayName), \(timeStatus()), \(source)"
+    }
+
+    private func activeSessionSourceTitle() -> String {
+        if sessionSource == .manual, scheduleAffectsActiveSession {
+            return "Manual + Schedule"
+        }
+        if scheduleDrivenSessionActive {
+            return "Schedule"
+        }
+        return sessionSource == .automation ? "Auto" : "Manual"
+    }
+
+    private var scheduleAffectsActiveSession: Bool {
+        session != nil && activeAutomationScheduleWindow != nil
+    }
+
+    private var scheduleDrivenSessionActive: Bool {
+        sessionSource == .automation && scheduleAffectsActiveSession
+    }
+
+    private var scheduleDrivenNoAjarSessionActive: Bool {
+        scheduleAffectsActiveSession &&
+            activeMode == .noAjar &&
+            activeAutomationScheduleWindow?.rule.mode == .noAjar
+    }
+
+    private func dashboardScheduleStatus() -> String? {
+        guard scheduleSettings.isEnabled else {
+            guard !scheduleSettings.rules.isEmpty else { return nil }
+            return "Schedule: Off, \(scheduleRuleCountTitle(scheduleSettings.rules.count))"
+        }
+
+        if scheduleAffectsActiveSession,
+           let activeAutomationScheduleWindow {
+            return "Schedule: \(activeAutomationScheduleWindow.rule.mode.displayName) active, \(scheduleTimeRange(activeAutomationScheduleWindow))"
+        }
+        if let active = activeScheduleWindow() {
+            return "Schedule: Active, \(scheduleSummary(active, prefixWithDay: false))"
+        }
+        if let next = NoAjarScheduleEvaluator.nextWindow(settings: scheduleSettings) {
+            return "Schedule: Next \(scheduleSummary(next, prefixWithDay: true))"
+        }
+        return "Schedule: On, no upcoming schedule"
+    }
+
+    private func scheduleTimeRange(_ window: NoAjarScheduleWindow) -> String {
+        "\(timeFormatter.string(from: window.start))-\(timeFormatter.string(from: window.end))"
     }
 
     private func timeStatus() -> String {
@@ -1580,7 +2112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             mode.displayName,
             mode == .noAjar ? #selector(toggleNoAjarMode) : #selector(toggleAwakeMode)
         )
-        item.state = activeMode == mode ? .on : .off
+        item.state = activeMode == mode || (mode == .noAjar && helperManagedNoAjarState) ? .on : .off
         applyIcon(mode == .noAjar ? "waveform.path.ecg" : "cup.and.saucer", to: item)
         return item
     }
@@ -1615,14 +2147,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         let submenu = NSMenu()
         submenu.autoenablesItems = false
 
-        submenu.addItem(iconItem("Edit Schedules...", #selector(editSchedules), symbolName: "calendar.badge.plus"))
+        let enabledItem = toggleItem("Scheduled Mode", #selector(toggleScheduledMode), state: scheduleSettings.isEnabled)
+        applyIcon("calendar.badge.clock", to: enabledItem)
+        submenu.addItem(enabledItem)
         submenu.addItem(.separator())
+        submenu.addItem(iconItem("Edit Schedules...", #selector(editSchedules), symbolName: "calendar.badge.plus"))
         if let active = activeScheduleWindow() {
+            submenu.addItem(.separator())
             submenu.addItem(disabledItem("Active: \(scheduleSummary(active, prefixWithDay: false))"))
         } else if let next = NoAjarScheduleEvaluator.nextWindow(settings: scheduleSettings) {
+            submenu.addItem(.separator())
             submenu.addItem(disabledItem("Next: \(scheduleSummary(next, prefixWithDay: true))"))
-        } else {
-            submenu.addItem(disabledItem(scheduleSettings.isEnabled ? "No upcoming schedule" : "Schedule is off"))
         }
 
         parent.submenu = submenu
@@ -1631,13 +2166,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
     private func scheduleMenuTitle() -> String {
         guard scheduleSettings.isEnabled else {
-            return "Schedule: Off"
+            guard !scheduleSettings.rules.isEmpty else {
+                return "Schedule: Off"
+            }
+            return "Schedule: Off, \(scheduleRuleCountTitle(scheduleSettings.rules.count))"
         }
         if activeScheduleWindow() != nil {
             return "Schedule: Active"
         }
         let count = scheduleSettings.rules.filter { $0.enabled }.count
-        return count == 1 ? "Schedule: 1 Rule" : "Schedule: \(count) Rules"
+        return "Schedule: \(scheduleRuleCountTitle(count))"
     }
 
     private func scheduleSummary(_ window: NoAjarScheduleWindow, prefixWithDay: Bool) -> String {
@@ -1648,10 +2186,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         return "\(time), \(window.rule.mode.displayName)"
     }
 
+    private func scheduleRuleCountTitle(_ count: Int) -> String {
+        count == 1 ? "1 Rule" : "\(count) Rules"
+    }
+
     private func hotspotConnectionMenuItem() -> NSMenuItem {
-        let title = hotspotKeepaliveEnabled ? "Keep Hotspot Connected: On" : "Keep Hotspot Connected: Off"
+        let displayedKeepaliveEnabled = displayedHotspotKeepaliveEnabled
+        let title = displayedKeepaliveEnabled ? "Keep Hotspot Connected: On" : "Keep Hotspot Connected: Off"
         let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        parent.state = hotspotKeepaliveEnabled ? .on : .off
+        parent.state = displayedKeepaliveEnabled ? .on : .off
         applyIcon("wifi", to: parent)
 
         let submenu = NSMenu()
@@ -1660,7 +2203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         applyIcon("wifi", to: toggle)
         submenu.addItem(toggle)
 
-        let hotspot = disabledItem("Hotspot: \(hotspotSSID ?? "Not Set")")
+        let hotspot = disabledItem("Network: \(displayedHotspotSSID ?? "Not Set")")
         applyIcon("iphone", to: hotspot)
         submenu.addItem(hotspot)
 
@@ -1887,9 +2430,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
     private func toggleMode(_ mode: AwakeMode) {
-        if activeMode == mode {
-            suppressActiveScheduleIfNeeded()
-            stopSession()
+        if activeMode == mode || (mode == .noAjar && helperManagedNoAjarState) {
+            if !stopSession(), let lastMessage {
+                showError(lastMessage)
+            }
             rebuildMenu()
             return
         }
@@ -1917,12 +2461,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         openScheduleEditor(with: scheduleSettings)
     }
 
+    @objc private func toggleScheduledMode() {
+        var settings = scheduleSettings
+        settings.isEnabled.toggle()
+        applyScheduleSettings(settings)
+        if !settings.isEnabled,
+           !scheduleSettings.isEnabled,
+           scheduleDrivenSessionActive,
+           let lastMessage {
+            showError(lastMessage)
+        }
+    }
+
     private func openScheduleEditor(with settings: NoAjarScheduleSettings) {
-        guard let updated = ScheduleEditorController(settings: settings).run() else {
+        guard let updated = ScheduleEditorController(
+            settings: settings,
+            defaultNetworkSSID: hotspotSSID,
+            initialNetworkSuggestions: scheduleNetworkSuggestions()
+        ).run() else {
             rebuildMenu()
             return
         }
         applyScheduleSettings(updated)
+    }
+
+    private func scheduleNetworkSuggestions() -> [String] {
+        uniqueNetworkNames(savedWiFiNetworkNames() + [
+            hotspotSSID,
+            currentWiFiNetworkName(allowSlowLookup: false)
+        ].compactMap { $0 })
     }
 
     private func applyScheduleSettings(_ settings: NoAjarScheduleSettings) {
@@ -1942,13 +2509,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         }
 
         scheduleSettings = settings
-        scheduleSuppressions = NoAjarScheduleEvaluator.suppressions(scheduleSuppressions, validAt: Date())
-        if !scheduleSettings.isEnabled {
-            scheduleSuppressions = []
-        }
         savePreferences()
         monitorTick()
-        rebuildMenu()
     }
 
     @objc private func toggleHotspotKeepalive() {
@@ -1961,6 +2523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         }
         if session != nil, activeAutomationScheduleWindow == nil {
             activeSessionHotspotKeepaliveEnabled = hotspotKeepaliveEnabled
+            activeSessionHotspotSSID = hotspotKeepaliveEnabled ? hotspotSSID : nil
         }
         savePreferences()
         if hotspotKeepaliveEnabled, let hotspotSSID {
@@ -1988,6 +2551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         hotspotKeepaliveEnabled = true
         if session != nil, activeAutomationScheduleWindow == nil {
             activeSessionHotspotKeepaliveEnabled = true
+            activeSessionHotspotSSID = ssid
         }
         resetHotspotKeepaliveSchedule()
         savePreferences()
@@ -1998,6 +2562,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
     @objc private func clearHotspotNetwork() {
         hotspotSSID = nil
+        if session != nil, activeAutomationScheduleWindow == nil {
+            activeSessionHotspotSSID = nil
+        }
         resetHotspotKeepaliveSchedule()
         savePreferences()
         lastMessage = "Hotspot forgotten."
@@ -2212,9 +2779,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         if mode == .noAjar, activeMode != .noAjar {
             promptHotspotKeepaliveForNoAjarStart()
         }
-        if session != nil {
-            suppressActiveScheduleIfNeeded()
-            stopSession()
+        if session != nil || helperManagedNoAjarState {
+            guard stopSession() else {
+                if let lastMessage {
+                    showError(lastMessage)
+                }
+                rebuildMenu()
+                return
+            }
         }
         startSession(mode: mode, duration: duration, source: .manual, reason: mode.displayName, showErrors: true)
     }
@@ -2252,9 +2824,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             return
         }
 
+        var pendingSession: LidAwakeSession?
         do {
             let usesNoAjarHelper = mode == .noAjar && privilegedHelper.isAuthorized
             let effectiveHotspotKeepalive = effectiveHotspotKeepaliveEnabled(mode: mode, scheduleWindow: scheduleWindow)
+            let effectiveNetworkSSID = effectiveHotspotSSID(mode: mode, scheduleWindow: scheduleWindow)
             let options = LidAwakeOptions(
                 mode: mode,
                 allowBattery: true,
@@ -2264,26 +2838,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 preventDisplaySleep: false,
                 manageLidSleepOverride: !usesNoAjarHelper,
                 hotspotKeepaliveEnabled: effectiveHotspotKeepalive,
-                hotspotSSID: hotspotSSID,
+                hotspotSSID: effectiveNetworkSSID,
                 reason: "NoAjar \(reason)"
             )
             let newSession = LidAwakeSession(options: options)
+            pendingSession = newSession
             try newSession.start()
             if usesNoAjarHelper {
                 try privilegedHelper.setNoAjarActive(true)
             }
             session = newSession
+            helperManagedNoAjarState = usesNoAjarHelper
             sessionSource = source
             activeMode = mode
             activeDurationSeconds = duration
             sessionEndsAt = duration.map { Date().addingTimeInterval($0) }
             activeAutomationScheduleWindow = source == .automation ? scheduleWindow : nil
             activeSessionHotspotKeepaliveEnabled = effectiveHotspotKeepalive
+            activeSessionHotspotSSID = effectiveHotspotKeepalive ? effectiveNetworkSSID : nil
             lastMessage = nil
-            syncLidBrightness()
+            syncLidDisplaySleep()
             runHotspotKeepalive(showSuccess: false)
             rebuildMenu()
         } catch {
+            pendingSession?.stop()
             lastMessage = error.localizedDescription
             if source == .automation {
                 automationSuppressedUntil = Date().addingTimeInterval(5 * 60)
@@ -2295,13 +2873,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         }
     }
 
-    private func stopSession() {
-        let shouldRestoreBrightness = activeMode == .noAjar
-        if activeMode == .noAjar {
+    @discardableResult
+    private func stopSession() -> Bool {
+        let shouldResetDisplaySleep = activeMode == .noAjar || helperManagedNoAjarState
+        if shouldResetDisplaySleep {
             do {
                 try privilegedHelper.setNoAjarActive(false)
+                helperManagedNoAjarState = false
             } catch {
                 lastMessage = error.localizedDescription
+                return false
             }
         }
         session?.stop()
@@ -2311,15 +2892,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         sessionEndsAt = nil
         activeAutomationScheduleWindow = nil
         activeSessionHotspotKeepaliveEnabled = false
+        activeSessionHotspotSSID = nil
         resetHotspotKeepaliveSchedule()
-        if shouldRestoreBrightness {
-            lidBrightnessController.restoreIfNeeded()
+        if shouldResetDisplaySleep {
+            lidDisplaySleepController.reset()
         }
+        return true
     }
 
     private func monitorTick() {
-        syncLidBrightness()
-        pruneScheduleSuppressions()
+        syncLidDisplaySleep()
         checkSafety()
         evaluateAutomation()
         rebuildMenu()
@@ -2334,12 +2916,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         mode: AwakeMode,
         scheduleWindow: NoAjarScheduleWindow?
     ) -> Bool {
-        if mode == .noAjar,
-           let scheduleWindow,
-           scheduleWindow.rule.mode == .noAjar {
+        if let scheduleWindow {
             return scheduleWindow.rule.keepHotspotConnected
         }
-        return hotspotKeepaliveEnabled
+        return mode == .noAjar && hotspotKeepaliveEnabled
+    }
+
+    private func effectiveHotspotSSID(
+        mode: AwakeMode,
+        scheduleWindow: NoAjarScheduleWindow?
+    ) -> String? {
+        if let scheduleWindow,
+           scheduleWindow.rule.keepHotspotConnected {
+            return scheduleWindow.rule.networkSSID ?? hotspotSSID
+        }
+        return hotspotSSID
     }
 
     private func runHotspotKeepalive(
@@ -2354,15 +2945,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         }
         guard !hotspotKeepaliveInProgress else { return }
         if requiresActiveSession {
-            guard session != nil,
-                  activeMode == .noAjar else {
+            guard session != nil else {
                 resetHotspotKeepaliveSchedule()
                 return
             }
         }
 
         hotspotKeepaliveInProgress = true
-        let targetSSID = hotspotSSID
+        let targetSSID = requiresActiveSession ? activeSessionHotspotSSID : hotspotSSID
         syncHotspotConnectionConfidence(targetSSID: targetSSID)
         let effectiveForceReconnect = forceReconnect || shouldForceSavedHotspotReconnect(
             targetSSID: targetSSID,
@@ -2380,6 +2970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             )
             await self.finishHotspotKeepalive(
                 result,
+                targetSSID: targetSSID,
                 showSuccess: showSuccess,
                 requiresActiveSession: requiresActiveSession
             )
@@ -2387,13 +2978,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
     private func syncHotspotConnectionConfidence(targetSSID: String?) {
+        if lastHotspotConnectionTargetSSID != targetSSID {
+            lastHotspotConnectionConfirmedAt = nil
+            lastHotspotConnectionTargetSSID = targetSSID
+        }
         guard let targetSSID else { return }
-        guard wifiStatus().linkActive else {
+        guard let health = currentHotspotConnectionHealth(targetSSID: targetSSID),
+              health.linkActive else {
             lastHotspotConnectionConfirmedAt = nil
             return
         }
-        if let currentSSID = currentWiFiNetworkName(allowSlowLookup: false),
-           currentSSID != targetSSID {
+        if health.confirmsTargetConnection {
+            lastHotspotConnectionConfirmedAt = Date()
+            return
+        }
+        if health.hasDifferentSSID {
             lastHotspotConnectionConfirmedAt = nil
         }
     }
@@ -2401,21 +3000,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private func shouldForceSavedHotspotReconnect(targetSSID: String?, requiresActiveSession: Bool) -> Bool {
         guard requiresActiveSession,
               let targetSSID else { return false }
-        let status = wifiStatus()
-        if status.currentSSID == targetSSID {
+        guard let health = currentHotspotConnectionHealth(targetSSID: targetSSID) else {
+            return true
+        }
+        if health.confirmsTargetConnection {
             lastHotspotConnectionConfirmedAt = Date()
+            lastHotspotConnectionTargetSSID = targetSSID
             return false
         }
-        if !status.linkActive {
+        if !health.linkActive || health.hasDifferentSSID {
             return true
         }
         return !recentlyConfirmedHotspotConnection(targetSSID: targetSSID)
     }
 
     private func recentlyConfirmedHotspotConnection(targetSSID: String) -> Bool {
-        guard hotspotSSID == targetSSID,
+        guard lastHotspotConnectionTargetSSID == targetSSID,
               let lastHotspotConnectionConfirmedAt else { return false }
-        guard wifiStatus().linkActive else { return false }
+        guard currentHotspotConnectionHealth(targetSSID: targetSSID)?.linkActive == true else { return false }
         return Date().timeIntervalSince(lastHotspotConnectionConfirmedAt) < HotspotKeepaliveTiming.confirmationWindow
     }
 
@@ -2423,11 +3025,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         if recentlyConfirmedHotspotConnection(targetSSID: targetSSID) {
             return false
         }
-        return currentWiFiNetworkName(allowSlowLookup: false) != targetSSID
+        return !currentHotspotConnectionConfirmsTarget(targetSSID: targetSSID)
     }
 
     private func finishHotspotKeepalive(
         _ result: HotspotKeepaliveResult,
+        targetSSID: String?,
         showSuccess: Bool,
         requiresActiveSession: Bool
     ) {
@@ -2438,16 +3041,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
             return
         }
         if requiresActiveSession {
-            guard session != nil,
-                  activeMode == .noAjar else {
+            guard session != nil else {
                 resetHotspotKeepaliveSchedule()
                 return
             }
         }
+        let currentTargetSSID = requiresActiveSession ? activeSessionHotspotSSID : hotspotSSID
+        guard currentTargetSSID == targetSSID else {
+            lastHotspotConnectionConfirmedAt = nil
+            lastHotspotConnectionTargetSSID = currentTargetSSID
+            if keepaliveEnabled {
+                runHotspotKeepalive(showSuccess: false, requiresActiveSession: requiresActiveSession)
+            }
+            return
+        }
 
-        let confirmedConnection = resultConfirmsSavedHotspotConnection(result)
+        let confirmedConnection = resultConfirmsSavedHotspotConnection(result, targetSSID: targetSSID)
         if confirmedConnection {
             lastHotspotConnectionConfirmedAt = Date()
+            lastHotspotConnectionTargetSSID = targetSSID
             hotspotKeepaliveFailureCount = 0
         } else if !result.success {
             lastHotspotConnectionConfirmedAt = nil
@@ -2457,13 +3069,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         }
         scheduleNextHotspotKeepalive(after: nextHotspotKeepaliveInterval(
             result: result,
-            confirmedConnection: confirmedConnection
+            confirmedConnection: confirmedConnection,
+            targetSSID: targetSSID
         ))
 
-        let wasShowingConnectionProgress = hotspotSSID.map { lastMessage == "Connecting to \($0)..." } ?? false
+        let wasShowingConnectionProgress = targetSSID.map { lastMessage == "Connecting to \($0)..." } ?? false
         if showSuccess || !result.success || result.didReconnect || wasShowingConnectionProgress {
-            if result.success, let hotspotSSID {
-                lastMessage = "Connected to \(hotspotSSID)."
+            if result.success, let targetSSID {
+                lastMessage = "Connected to \(targetSSID)."
             } else {
                 lastMessage = result.message
             }
@@ -2476,6 +3089,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         hotspotKeepaliveTimer = nil
         hotspotKeepaliveFailureCount = 0
         lastHotspotConnectionConfirmedAt = nil
+        lastHotspotConnectionTargetSSID = nil
     }
 
     private func scheduleNextHotspotKeepalive(after interval: TimeInterval) {
@@ -2489,7 +3103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
     private func nextHotspotKeepaliveInterval(
         result: HotspotKeepaliveResult,
-        confirmedConnection: Bool
+        confirmedConnection: Bool,
+        targetSSID: String?
     ) -> TimeInterval {
         if confirmedConnection {
             return result.didReconnect ? HotspotKeepaliveTiming.connectedSoon : HotspotKeepaliveTiming.stableConnected
@@ -2500,7 +3115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
         let extraFailures = max(0, hotspotKeepaliveFailureCount - 1)
         let status = wifiStatus()
-        if !status.linkActive || hotspotSSID.map({ status.currentSSID != $0 }) == true {
+        if !status.linkActive || targetSSID.map({ status.currentSSID != $0 }) == true {
             return min(
                 HotspotKeepaliveTiming.disconnectedRetry +
                     Double(extraFailures) * HotspotKeepaliveTiming.disconnectedRetryStep,
@@ -2514,24 +3129,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         )
     }
 
-    private func resultConfirmsSavedHotspotConnection(_ result: HotspotKeepaliveResult) -> Bool {
-        guard result.success,
-              let hotspotSSID else { return false }
-        if result.didReconnect {
-            return true
-        }
-        return currentWiFiNetworkName(allowSlowLookup: false) == hotspotSSID
+    private func resultConfirmsSavedHotspotConnection(_ result: HotspotKeepaliveResult, targetSSID: String?) -> Bool {
+        guard result.success, targetSSID != nil else { return false }
+        return true
     }
 
-    private func syncLidBrightness() {
-        lidBrightnessController.sync(noAjarActive: session != nil && activeMode == .noAjar)
+    private func syncLidDisplaySleep() {
+        lidDisplaySleepController.sync(noAjarActive: session != nil && activeMode == .noAjar)
     }
 
     private func checkSafety() {
         guard let session else { return }
         if let reason = session.safetyStopReason() {
             let wasManual = sessionSource == .manual
-            stopSession()
+            guard stopSession() else {
+                if wasManual, let lastMessage {
+                    showError(lastMessage)
+                }
+                return
+            }
             lastMessage = "\(reason) Stopped for safety."
             if wasManual {
                 showError(lastMessage ?? "Stopped for safety.")
@@ -2548,7 +3164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         automationSuppressedUntil = nil
 
         let decision = automationDecision(at: now)
-        lastAutomationReasons = decision?.reasons ?? []
+        lastAutomationReasons = []
 
         if session == nil, let decision {
             startSession(
@@ -2559,18 +3175,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 showErrors: false,
                 scheduleWindow: decision.scheduleWindow
             )
+            if sessionSource == .automation {
+                lastAutomationReasons = decision.reasons
+            }
             return
         }
 
-        guard sessionSource == .automation else { return }
+        guard sessionSource == .automation else {
+            syncManualSessionScheduleOverlay(decision)
+            return
+        }
 
         guard let decision else {
             stopSession()
             return
         }
 
+        lastAutomationReasons = decision.reasons
+
         if activeMode != decision.mode {
-            stopSession()
+            guard stopSession() else { return }
             startSession(
                 mode: decision.mode,
                 duration: nil,
@@ -2579,6 +3203,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
                 showErrors: false,
                 scheduleWindow: decision.scheduleWindow
             )
+            if sessionSource == .automation {
+                lastAutomationReasons = decision.reasons
+            }
             return
         }
 
@@ -2605,6 +3232,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
         return AutomationDecision(mode: mode, reasons: reasons, scheduleWindow: scheduleWindow)
     }
 
+    private func syncManualSessionScheduleOverlay(_ decision: AutomationDecision?) {
+        guard session != nil,
+              sessionSource == .manual,
+              let activeMode else { return }
+
+        guard let decision,
+              let scheduleWindow = decision.scheduleWindow,
+              scheduleWindow.rule.mode == activeMode else {
+            clearManualSessionScheduleOverlayIfNeeded(activeMode: activeMode)
+            return
+        }
+
+        activeAutomationScheduleWindow = scheduleWindow
+        lastAutomationReasons = decision.reasons
+        syncActiveSessionHotspotKeepalive(mode: activeMode, scheduleWindow: scheduleWindow)
+    }
+
+    private func clearManualSessionScheduleOverlayIfNeeded(activeMode: AwakeMode) {
+        guard activeAutomationScheduleWindow != nil else { return }
+
+        activeAutomationScheduleWindow = nil
+        syncActiveSessionHotspotKeepalive(mode: activeMode, scheduleWindow: nil)
+    }
+
     private func preferredAutomationMode(_ lhs: AwakeMode?, _ rhs: AwakeMode) -> AwakeMode {
         if lhs == .noAjar || rhs == .noAjar {
             return .noAjar
@@ -2613,13 +3264,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     }
 
     private func syncActiveAutomationHotspotKeepalive(_ decision: AutomationDecision) {
+        syncActiveSessionHotspotKeepalive(mode: decision.mode, scheduleWindow: decision.scheduleWindow)
+    }
+
+    private func syncActiveSessionHotspotKeepalive(
+        mode: AwakeMode,
+        scheduleWindow: NoAjarScheduleWindow?
+    ) {
         let effective = effectiveHotspotKeepaliveEnabled(
-            mode: decision.mode,
-            scheduleWindow: decision.scheduleWindow
+            mode: mode,
+            scheduleWindow: scheduleWindow
         )
-        guard activeSessionHotspotKeepaliveEnabled != effective else { return }
-        activeSessionHotspotKeepaliveEnabled = effective
-        if effective {
+        let effectiveSSID = effectiveHotspotSSID(
+            mode: mode,
+            scheduleWindow: scheduleWindow
+        )
+        applyActiveSessionHotspotKeepalive(enabled: effective, ssid: effectiveSSID)
+    }
+
+    private func applyActiveSessionHotspotKeepalive(enabled: Bool, ssid: String?) {
+        let targetSSID = enabled ? ssid : nil
+        let targetChanged = activeSessionHotspotSSID != targetSSID
+        guard activeSessionHotspotKeepaliveEnabled != enabled || targetChanged else { return }
+        activeSessionHotspotKeepaliveEnabled = enabled
+        activeSessionHotspotSSID = targetSSID
+        if targetChanged {
+            resetHotspotKeepaliveSchedule()
+        }
+        if enabled {
             runHotspotKeepalive(showSuccess: false)
         } else {
             resetHotspotKeepaliveSchedule()
@@ -2629,29 +3301,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
     private func activeScheduleWindow(at date: Date = Date()) -> NoAjarScheduleWindow? {
         NoAjarScheduleEvaluator.activeWindow(
             settings: scheduleSettings,
-            suppressions: scheduleSuppressions,
+            suppressions: [],
             at: date
         )
-    }
-
-    private func suppressActiveScheduleIfNeeded() {
-        guard sessionSource == .automation,
-              let window = activeAutomationScheduleWindow,
-              Date() < window.end else {
-            return
-        }
-
-        scheduleSuppressions.removeAll { $0.ruleID == window.rule.id }
-        scheduleSuppressions.append(NoAjarScheduleSuppression(ruleID: window.rule.id, windowEnd: window.end))
-        scheduleSuppressions = NoAjarScheduleEvaluator.suppressions(scheduleSuppressions, validAt: Date())
-        savePreferences()
-    }
-
-    private func pruneScheduleSuppressions() {
-        let pruned = NoAjarScheduleEvaluator.suppressions(scheduleSuppressions, validAt: Date())
-        guard pruned != scheduleSuppressions else { return }
-        scheduleSuppressions = pruned
-        savePreferences()
     }
 
     private func currentAppVersion() -> String {
@@ -2718,6 +3370,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SPUUpd
 
 }
 
+private let scheduleRuleRowWidth: CGFloat = 688
+private let scheduleRowsScrollHeight: CGFloat = 360
+private let compactScheduleRuleRowHeight: CGFloat = 126
+private let expandedScheduleRuleRowHeight: CGFloat = 154
+
 private let scheduleWeekdays: [(title: String, fullTitle: String, value: Int)] = [
     ("Mon", "Monday", 2),
     ("Tue", "Tuesday", 3),
@@ -2727,6 +3384,44 @@ private let scheduleWeekdays: [(title: String, fullTitle: String, value: Int)] =
     ("Sat", "Saturday", 7),
     ("Sun", "Sunday", 1)
 ]
+
+private func uniqueNetworkNames(_ names: [String]) -> [String] {
+    var seen = Set<String>()
+    var unique: [String] = []
+    for name in names {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        let key = normalizedNetworkSearchKey(trimmed)
+        guard seen.insert(key).inserted else { continue }
+        unique.append(trimmed)
+    }
+    return unique.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+}
+
+private func normalizedNetworkSearchKey(_ value: String) -> String {
+    value
+        .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
+        .lowercased()
+}
+
+private func networkMatchScore(name: String, normalizedQuery: String) -> Int? {
+    let normalizedName = normalizedNetworkSearchKey(name)
+    if normalizedName.hasPrefix(normalizedQuery) {
+        return 0
+    }
+
+    let parts = normalizedName.split { character in
+        character == "_" || character == "-" || character == " " || character == "."
+    }
+    if parts.contains(where: { $0.hasPrefix(normalizedQuery) }) {
+        return 1
+    }
+
+    guard let range = normalizedName.range(of: normalizedQuery) else {
+        return nil
+    }
+    return 2 + normalizedName.distance(from: normalizedName.startIndex, to: range.lowerBound)
+}
 
 private let timeFormatter: DateFormatter = {
     let formatter = DateFormatter()
@@ -2919,21 +3614,68 @@ private func durationsMatch(_ lhs: TimeInterval?, _ rhs: TimeInterval?) -> Bool 
     }
 }
 
-private func dateForMinuteOfDay(_ minute: Int) -> Date {
-    let safeMinute = min(max(minute, 0), 24 * 60 - 1)
-    var components = DateComponents()
-    components.calendar = Calendar.current
-    components.year = 2001
-    components.month = 1
-    components.day = 1
-    components.hour = safeMinute / 60
-    components.minute = safeMinute % 60
-    return components.date ?? Date(timeIntervalSinceReferenceDate: 0)
+private func minuteOfDayFromTimeInput(_ raw: String, acceptsThreeDigitInput: Bool) -> Int? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let normalized = trimmed.replacingOccurrences(of: "：", with: ":")
+    if normalized.contains(":") {
+        let parts = normalized.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              (1...2).contains(parts[0].count),
+              parts[1].count == 2,
+              let hour = Int(parts[0]),
+              let minute = Int(parts[1]),
+              (0...23).contains(hour),
+              (0...59).contains(minute) else {
+            return nil
+        }
+        return hour * 60 + minute
+    }
+    return minuteOfDayFromCompactTimeInput(normalized, acceptsThreeDigitInput: acceptsThreeDigitInput)
 }
 
-private func minuteOfDay(from date: Date) -> Int {
-    let components = Calendar.current.dateComponents([.hour, .minute], from: date)
-    return (components.hour ?? 0) * 60 + (components.minute ?? 0)
+private func normalizedTimeInputString(_ raw: String) -> String {
+    let normalized = raw
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "：", with: ":")
+    guard let colonIndex = normalized.firstIndex(of: ":") else {
+        return String(normalized.filter(\.isWholeNumber).prefix(4))
+    }
+
+    let hour = normalized[..<colonIndex].filter(\.isWholeNumber).prefix(2)
+    let minute = normalized[normalized.index(after: colonIndex)...].filter(\.isWholeNumber).prefix(2)
+    return "\(String(hour)):\(String(minute))"
+}
+
+private func minuteOfDayFromCompactTimeInput(_ raw: String, acceptsThreeDigitInput: Bool) -> Int? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.allSatisfy(\.isWholeNumber) else {
+        return nil
+    }
+
+    let hourText: Substring
+    let minuteText: Substring
+    if trimmed.count == 3, acceptsThreeDigitInput {
+        hourText = trimmed.prefix(1)
+        minuteText = trimmed.suffix(2)
+    } else if trimmed.count == 4 {
+        hourText = trimmed.prefix(2)
+        minuteText = trimmed.suffix(2)
+    } else {
+        return nil
+    }
+
+    guard let hour = Int(hourText),
+          let minute = Int(minuteText),
+          (0...23).contains(hour),
+          (0...59).contains(minute) else {
+        return nil
+    }
+    return hour * 60 + minute
+}
+
+private func compactTimeDisplayString(_ minute: Int) -> String {
+    let safeMinute = min(max(minute, 0), 24 * 60 - 1)
+    return String(format: "%02d:%02d", safeMinute / 60, safeMinute % 60)
 }
 
 private func fourCharCode(_ value: String) -> OSType {

@@ -188,7 +188,7 @@ do {
         let options = try parseOptions(Array(args.dropFirst()))
         try start(options)
     case "stop":
-        stopExistingSessionOrRestore()
+        try stopExistingSessionOrRestore()
     case "status":
         status()
     case "hotspot-keepalive":

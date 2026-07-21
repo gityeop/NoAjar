@@ -144,7 +144,7 @@ advertise a hidden or unavailable hotspot.
 
 When a saved hotspot exists and you manually start No Ajar Mode, NoAjar asks
 whether to keep that hotspot connected. Scheduled No Ajar sessions do not show
-that prompt; they use the per-schedule hotspot setting.
+that prompt; they use the per-schedule network setting.
 
 ### Schedule
 
@@ -159,8 +159,13 @@ The menu title is:
 
 `Schedule` includes:
 
+- Scheduled Mode: enables or disables all schedule rules.
 - Edit Schedules...
 - Active or next schedule summary
+
+Scheduled Mode can be enabled with no rules. Turning it off immediately stops a
+session whose only trigger is Schedule; manual sessions and App Auto Awake
+sessions continue when they still have their own active reason.
 
 The schedule editor supports:
 
@@ -169,7 +174,7 @@ The schedule editor supports:
 - Awake Mode or No Ajar Mode per rule.
 - Weekday selection.
 - Start and end times.
-- Per-rule Hotspot checkbox for No Ajar schedules.
+- Per-rule Network combo box for choosing a saved Wi-Fi network or hotspot.
 - Delete rule.
 - Add Rule, Cancel, and Save.
 

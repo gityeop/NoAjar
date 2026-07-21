@@ -11,18 +11,15 @@ SPARKLE_GENERATE_APPCAST ?= $(SPARKLE_BIN_DIR)/generate_appcast
 VERSION ?= $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/LidAwakeApp/Info.plist)
 UPDATE_DOWNLOAD_PREFIX ?= https://github.com/gityeop/NoAjar/releases/download/v$(VERSION)/
 NOTARY_PROFILE ?= FlowClip-Notary
-SIGN_IDENTITY ?= $(shell /usr/bin/security find-identity -v -p codesigning 2>/dev/null | /usr/bin/awk -F\" '/Developer ID Application:/ { print $$2; exit }')
-SIGN_IDENTITY := $(if $(strip $(SIGN_IDENTITY)),$(SIGN_IDENTITY),-)
-TIMESTAMP_FLAG := $(if $(filter -,$(SIGN_IDENTITY)),,--timestamp)
-RUNTIME_FLAG := $(if $(filter -,$(SIGN_IDENTITY)),,--options runtime)
-CODESIGN_FLAGS := --force $(RUNTIME_FLAG) $(TIMESTAMP_FLAG) --sign "$(SIGN_IDENTITY)"
+SIGN_IDENTITY ?= $(shell /usr/bin/security find-identity -v -p codesigning | /usr/bin/awk -F\" '/Developer ID Application:/ { print $$2; exit }')
+CODESIGN_FLAGS := --force --options runtime --timestamp --sign "$(SIGN_IDENTITY)"
 SWIFT_BUILD_FLAGS ?= -c release --arch arm64 --arch x86_64
-SWIFT_RELEASE_BIN_DIR ?= .build/apple/Products/Release
 
 build:
 	swift build $(SWIFT_BUILD_FLAGS)
 
 app:
+	@test -n "$(SIGN_IDENTITY)" || (echo "Developer ID Application signing identity is required." >&2; exit 2)
 	swift build $(SWIFT_BUILD_FLAGS) --product noajar
 	swift build $(SWIFT_BUILD_FLAGS) --product noajar-hotspot
 	swift build $(SWIFT_BUILD_FLAGS) --product LidAwakeMenuBar
@@ -34,15 +31,18 @@ app:
 	install -d "$(APP_BUNDLE)/Contents/Frameworks"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchServices"
 	install -d "$(APP_BUNDLE)/Contents/Library/LaunchDaemons"
-	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/LidAwakeMenuBar" "$(APP_BUNDLE)/Contents/MacOS/NoAjar"
-	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/noajar" "$(APP_BUNDLE)/Contents/Helpers/noajar"
-	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/noajar-hotspot" "$(APP_BUNDLE)/Contents/Helpers/noajar-hotspot"
-	install -m 0755 "$(SWIFT_RELEASE_BIN_DIR)/NoAjarHelper" "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
+	set -e; \
+	SWIFT_RELEASE_BIN_DIR="$$(swift build $(SWIFT_BUILD_FLAGS) --show-bin-path)"; \
+	install -m 0755 "$$SWIFT_RELEASE_BIN_DIR/LidAwakeMenuBar" "$(APP_BUNDLE)/Contents/MacOS/NoAjar"; \
+	install -m 0755 "$$SWIFT_RELEASE_BIN_DIR/noajar" "$(APP_BUNDLE)/Contents/Helpers/noajar"; \
+	install -m 0755 "$$SWIFT_RELEASE_BIN_DIR/noajar-hotspot" "$(APP_BUNDLE)/Contents/Helpers/noajar-hotspot"; \
+	install -m 0755 "$$SWIFT_RELEASE_BIN_DIR/NoAjarHelper" "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"; \
+	test -d "$$SWIFT_RELEASE_BIN_DIR/Sparkle.framework"; \
+	ditto "$$SWIFT_RELEASE_BIN_DIR/Sparkle.framework" "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
 	install -m 0644 Resources/NoAjarHelper/dev.local.noajar.helper.plist "$(APP_BUNDLE)/Contents/Library/LaunchDaemons/dev.local.noajar.helper.plist"
 	install -m 0644 Resources/LidAwakeApp/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	install -m 0644 Resources/LidAwakeApp/NoAjar.icns "$(APP_BUNDLE)/Contents/Resources/NoAjar.icns"
-	SPARKLE_FRAMEWORK="$$(swift build $(SWIFT_BUILD_FLAGS) --show-bin-path)/Sparkle.framework"; test -d "$$SPARKLE_FRAMEWORK"; ditto "$$SPARKLE_FRAMEWORK" "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"
-	install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP_BUNDLE)/Contents/MacOS/NoAjar" 2>/dev/null || true
+	install_name_tool -add_rpath "@executable_path/../Frameworks" "$(APP_BUNDLE)/Contents/MacOS/NoAjar"
 	codesign $(CODESIGN_FLAGS) --identifier dev.local.noajar.helper "$(APP_BUNDLE)/Contents/Library/LaunchServices/dev.local.noajar.helper"
 	codesign $(CODESIGN_FLAGS) "$(APP_BUNDLE)/Contents/Helpers/noajar"
 	codesign $(CODESIGN_FLAGS) "$(APP_BUNDLE)/Contents/Helpers/noajar-hotspot"

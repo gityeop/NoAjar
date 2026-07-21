@@ -10,11 +10,29 @@ private struct HelperState: Codable {
 private final class HelperService: NSObject, NoAjarHelperProtocol {
     func enableNoAjar(withReply reply: @escaping (Bool, NSString?) -> Void) {
         do {
-            if loadState() == nil {
-                let previous = currentDisableSleep() ?? 0
-                try saveState(HelperState(previousDisableSleep: previous, enabledAt: Date()))
+            let existingState = try loadState()
+            let createdState = existingState == nil
+            let state: HelperState
+            if let existingState {
+                state = existingState
+            } else {
+                let previous = try readSleepDisabled()
+                state = HelperState(previousDisableSleep: previous, enabledAt: Date())
+                try saveState(state)
             }
-            try setDisableSleep(1)
+            do {
+                try setDisableSleep(1)
+            } catch let enableError {
+                if createdState {
+                    do {
+                        try setDisableSleep(state.previousDisableSleep)
+                        try removeState()
+                    } catch let restoreError {
+                        throw HelperError("\(enableError.localizedDescription)\nFailed to restore SleepDisabled: \(restoreError.localizedDescription)")
+                    }
+                }
+                throw enableError
+            }
             reply(true, nil)
         } catch {
             reply(false, error.localizedDescription as NSString)
@@ -23,9 +41,11 @@ private final class HelperService: NSObject, NoAjarHelperProtocol {
 
     func disableNoAjar(withReply reply: @escaping (Bool, NSString?) -> Void) {
         do {
-            let previous = loadState()?.previousDisableSleep ?? 0
-            try setDisableSleep(previous)
-            removeState()
+            guard let state = try loadState() else {
+                throw HelperError("No saved NoAjar helper state was found; refusing to change SleepDisabled.")
+            }
+            try setDisableSleep(state.previousDisableSleep)
+            try removeState()
             reply(true, nil)
         } catch {
             reply(false, error.localizedDescription as NSString)
@@ -33,8 +53,21 @@ private final class HelperService: NSObject, NoAjarHelperProtocol {
     }
 
     func status(withReply reply: @escaping (Bool, NSString?) -> Void) {
-        let active = currentDisableSleep() == 1
-        reply(active, nil)
+        do {
+            reply(try readSleepDisabled() == 1, nil)
+        } catch {
+            reply(false, error.localizedDescription as NSString)
+        }
+    }
+
+    func statusV2(withReply reply: @escaping (Bool, Bool, NSString?) -> Void) {
+        do {
+            let isManaged = try loadState() != nil
+            let isSleepDisabled = try readSleepDisabled() == 1
+            reply(isManaged, isSleepDisabled, nil)
+        } catch {
+            reply(false, false, error.localizedDescription as NSString)
+        }
     }
 }
 
@@ -75,17 +108,6 @@ private func validateClient(pid: pid_t) -> Bool {
     return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
 }
 
-private func currentDisableSleep() -> Int? {
-    guard let result = try? run("/usr/bin/pmset", ["-g", "custom"]) else { return nil }
-    for line in result.output.split(separator: "\n") {
-        let parts = line.split { $0 == " " || $0 == "\t" }
-        if parts.first == "disablesleep", parts.count >= 2 {
-            return Int(parts[1])
-        }
-    }
-    return nil
-}
-
 private func setDisableSleep(_ value: Int) throws {
     guard value == 0 || value == 1 else {
         throw HelperError("Invalid disablesleep value.")
@@ -93,6 +115,9 @@ private func setDisableSleep(_ value: Int) throws {
     let result = try run("/usr/bin/pmset", ["-a", "disablesleep", "\(value)"])
     guard result.status == 0 else {
         throw HelperError(result.errorOrOutput(defaultMessage: "pmset failed."))
+    }
+    guard try readSleepDisabled() == value else {
+        throw HelperError("SleepDisabled did not change to \(value).")
     }
 }
 
@@ -102,13 +127,14 @@ private func saveState(_ state: HelperState) throws {
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: noAjarHelperStateURL.path)
 }
 
-private func loadState() -> HelperState? {
-    guard let data = try? Data(contentsOf: noAjarHelperStateURL) else { return nil }
-    return try? JSONDecoder().decode(HelperState.self, from: data)
+private func loadState() throws -> HelperState? {
+    guard FileManager.default.fileExists(atPath: noAjarHelperStateURL.path) else { return nil }
+    let data = try Data(contentsOf: noAjarHelperStateURL)
+    return try JSONDecoder().decode(HelperState.self, from: data)
 }
 
-private func removeState() {
-    try? FileManager.default.removeItem(at: noAjarHelperStateURL)
+private func removeState() throws {
+    try FileManager.default.removeItem(at: noAjarHelperStateURL)
 }
 
 private struct CommandResult {

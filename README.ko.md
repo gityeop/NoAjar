@@ -141,7 +141,7 @@ private API fallback을 사용합니다.
 
 저장된 핫스팟이 있을 때 No Ajar Mode를 수동으로 시작하면 NoAjar가 해당 핫스팟을
 유지할지 묻습니다. 스케줄로 시작된 No Ajar 세션은 질문창을 띄우지 않고, 각
-스케줄의 Hotspot 설정을 사용합니다.
+스케줄의 Network 설정을 사용합니다.
 
 ### Schedule
 
@@ -156,8 +156,13 @@ private API fallback을 사용합니다.
 
 `Schedule`에는 다음 항목이 있습니다.
 
+- Scheduled Mode: 전체 스케줄 규칙을 켜거나 끕니다.
 - Edit Schedules...
 - 현재 활성 스케줄 또는 다음 스케줄 요약
+
+규칙이 없어도 Scheduled Mode를 켤 수 있습니다. Scheduled Mode를 끄면 Schedule만
+원인인 세션은 즉시 종료되고, 사용자가 직접 시작한 세션과 별도의 실행 조건이 남아
+있는 App Auto Awake 세션은 계속 실행됩니다.
 
 스케줄 편집 창은 다음 기능을 지원합니다.
 
@@ -166,7 +171,7 @@ private API fallback을 사용합니다.
 - 규칙별 Awake Mode 또는 No Ajar Mode
 - 요일 선택
 - 시작/종료 시간
-- No Ajar 스케줄별 Hotspot 체크박스
+- 규칙별 저장된 Wi-Fi 또는 핫스팟 Network 선택 콤보박스
 - 규칙 삭제
 - Add Rule, Cancel, Save
 

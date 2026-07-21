@@ -19,6 +19,7 @@ public protocol NoAjarHelperProtocol {
     func enableNoAjar(withReply reply: @escaping (Bool, NSString?) -> Void)
     func disableNoAjar(withReply reply: @escaping (Bool, NSString?) -> Void)
     func status(withReply reply: @escaping (Bool, NSString?) -> Void)
+    func statusV2(withReply reply: @escaping (Bool, Bool, NSString?) -> Void)
 }
 
 public enum AwakeMode: String, CaseIterable, Codable {
@@ -113,6 +114,55 @@ public struct WiFiStatus {
     public let linkActive: Bool
 }
 
+struct HotspotLinkSignals: Sendable {
+    let usesIPv6Translation: Bool
+    let hasConstrainedHotspotAddress: Bool
+
+    var hasHotspotSignature: Bool {
+        usesIPv6Translation || hasConstrainedHotspotAddress
+    }
+
+    init(ipconfigSummary: String?, ifconfigOutput: String?) {
+        let ipconfigSummary = ipconfigSummary ?? ""
+        let ifconfigOutput = ifconfigOutput ?? ""
+        usesIPv6Translation = ipconfigSummary.contains("CLAT46Active : TRUE") ||
+            ifconfigOutput.contains("nat64 prefix")
+        hasConstrainedHotspotAddress = ifconfigOutput.contains("constrained") &&
+            ifconfigOutput.contains("inet 192.0.0.2")
+    }
+}
+
+public struct HotspotConnectionHealth: Sendable {
+    public let interface: String
+    public let currentSSID: String?
+    public let targetSSID: String?
+    public let linkActive: Bool
+    public let gateway: String?
+    public let internetReachable: Bool
+    public let usesIPv6Translation: Bool
+    public let hasConstrainedHotspotAddress: Bool
+
+    public var hasHotspotSignature: Bool {
+        usesIPv6Translation || hasConstrainedHotspotAddress
+    }
+
+    public var hasDifferentSSID: Bool {
+        guard let currentSSID, let targetSSID else { return false }
+        return currentSSID != targetSSID
+    }
+
+    public var confirmsTargetConnection: Bool {
+        guard let targetSSID else { return false }
+        if currentSSID == targetSSID {
+            return linkActive && internetReachable
+        }
+        guard currentSSID == nil else {
+            return false
+        }
+        return linkActive && internetReachable && hasHotspotSignature
+    }
+}
+
 public struct HotspotKeepaliveResult: Sendable {
     public let success: Bool
     public let message: String
@@ -136,37 +186,31 @@ public func performHotspotKeepalive(
     let targetSSID = rawTargetSSID?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .nilIfEmpty
-    let linkActive = wifiLinkIsActive(interface: interface)
+    var health = hotspotConnectionHealth(interface: interface, targetSSID: targetSSID)
 
     if let targetSSID {
-        if forceReconnect {
-            let currentSSID = linkActive ? currentWiFiSSID(interface: interface, allowSlowLookup: true) : nil
-            if !linkActive || currentSSID != targetSSID {
-                return reconnectToWiFi(interface: interface, ssid: targetSSID)
-            }
-        } else if !linkActive {
+        health = healthForTargetConfirmation(interface: interface, targetSSID: targetSSID, current: health)
+        if let result = successfulKeepaliveResult(from: health) {
+            return result
+        }
+        if !health.linkActive {
             return reconnectToWiFi(interface: interface, ssid: targetSSID)
-        } else if currentWiFiSSID(interface: interface) == targetSSID {
-            // Keep checking the gateway below.
-        } else if let gateway = wifiGateway(interface: interface),
-                  networkResponds(interface: interface, gateway: gateway) {
-            return HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: gateway \(gateway) reached.")
-        } else {
+        }
+        if forceReconnect || health.hasDifferentSSID || health.currentSSID == nil || !health.internetReachable {
             return reconnectToWiFi(interface: interface, ssid: targetSSID)
         }
     }
 
-    guard linkActive else {
+    guard health.linkActive else {
         return HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: Wi-Fi is not connected.")
     }
-    guard let gateway = wifiGateway(interface: interface) else {
-        return HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: Wi-Fi gateway was not found.")
+    guard let result = successfulKeepaliveResult(from: health) else {
+        if let gateway = health.gateway {
+            return HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: gateway \(gateway) did not respond.")
+        }
+        return HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: internet did not respond.")
     }
-
-    guard networkResponds(interface: interface, gateway: gateway) else {
-        return HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: gateway \(gateway) did not respond.")
-    }
-    return HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: gateway \(gateway) reached.")
+    return result
 }
 
 public func performHotspotKeepaliveAndExit(
@@ -181,36 +225,31 @@ public func performHotspotKeepaliveAndExit(
     let targetSSID = rawTargetSSID?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .nilIfEmpty
-    let linkActive = wifiLinkIsActive(interface: interface)
+    var health = hotspotConnectionHealth(interface: interface, targetSSID: targetSSID)
 
     if let targetSSID {
-        if forceReconnect {
-            let currentSSID = linkActive ? currentWiFiSSID(interface: interface, allowSlowLookup: true) : nil
-            if !linkActive || currentSSID != targetSSID {
-                reconnectToWiFiAndExit(interface: interface, ssid: targetSSID, exitHandler: exitHandler)
-            }
-        } else if !linkActive {
+        health = healthForTargetConfirmation(interface: interface, targetSSID: targetSSID, current: health)
+        if let result = successfulKeepaliveResult(from: health) {
+            exitHandler(result)
+        }
+        if !health.linkActive {
             reconnectToWiFiAndExit(interface: interface, ssid: targetSSID, exitHandler: exitHandler)
-        } else if currentWiFiSSID(interface: interface) == targetSSID {
-            // Keep checking the gateway below.
-        } else if let gateway = wifiGateway(interface: interface),
-                  networkResponds(interface: interface, gateway: gateway) {
-            exitHandler(HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: gateway \(gateway) reached."))
-        } else {
+        }
+        if forceReconnect || health.hasDifferentSSID || health.currentSSID == nil || !health.internetReachable {
             reconnectToWiFiAndExit(interface: interface, ssid: targetSSID, exitHandler: exitHandler)
         }
     }
 
-    guard linkActive else {
+    guard health.linkActive else {
         exitHandler(HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: Wi-Fi is not connected."))
     }
-    guard let gateway = wifiGateway(interface: interface) else {
-        exitHandler(HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: Wi-Fi gateway was not found."))
+    guard let result = successfulKeepaliveResult(from: health) else {
+        if let gateway = health.gateway {
+            exitHandler(HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: gateway \(gateway) did not respond."))
+        }
+        exitHandler(HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: internet did not respond."))
     }
-    guard networkResponds(interface: interface, gateway: gateway) else {
-        exitHandler(HotspotKeepaliveResult(success: false, message: "Hotspot Keepalive: gateway \(gateway) did not respond."))
-    }
-    exitHandler(HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: gateway \(gateway) reached."))
+    exitHandler(result)
 }
 
 public final class LidAwakeSession {
@@ -240,10 +279,10 @@ public final class LidAwakeSession {
         var didSaveState = false
         do {
             if options.mode.preventsLidSleep && options.manageLidSleepOverride {
-                let previous = currentDisableSleep()
+                let previous = try readSleepDisabled()
                 try saveState(previousDisableSleep: previous)
                 didSaveState = true
-                try startPrivilegedLidSleepHelper(previousDisableSleep: previous ?? 0)
+                try startPrivilegedLidSleepHelper(previousDisableSleep: previous)
                 didOverrideLidSleep = true
             }
             systemAssertionID = try createSleepAssertion(
@@ -388,15 +427,15 @@ public func statusSnapshot() -> LidAwakeStatus {
     )
 }
 
-public func repairStaleStateIfNeeded() {
+public func repairStaleStateIfNeeded() throws {
     guard let state = loadState(), !processIsRunning(pid: state.pid) else { return }
-    guard currentDisableSleep() == 1 else {
+    guard try readSleepDisabled() == 1 else {
         removeState()
         return
     }
 }
 
-public func stopExistingSessionOrRestore() {
+public func stopExistingSessionOrRestore() throws {
     if let state = loadState(), state.pid != getpid(), processIsRunning(pid: state.pid) {
         if kill(state.pid, SIGTERM) == 0 {
             print("Sent stop signal to pid \(state.pid).")
@@ -404,7 +443,7 @@ public func stopExistingSessionOrRestore() {
         }
     }
 
-    restoreDisableSleep()
+    try restoreDisableSleep()
 }
 
 public func isAnyProcessRunning(matching names: [String]) -> Bool {
@@ -437,6 +476,45 @@ public func wifiStatus() -> WiFiStatus {
 public func currentWiFiNetworkName(allowSlowLookup: Bool = false) -> String? {
     guard let interface = wifiInterface() else { return nil }
     return currentWiFiSSID(interface: interface, allowSlowLookup: allowSlowLookup)
+}
+
+public func currentHotspotConnectionHealth(targetSSID rawTargetSSID: String? = nil) -> HotspotConnectionHealth? {
+    guard let interface = wifiInterface() else { return nil }
+    let targetSSID = rawTargetSSID?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nilIfEmpty
+    return hotspotConnectionHealth(interface: interface, targetSSID: targetSSID)
+}
+
+public func currentHotspotConnectionConfirmsTarget(targetSSID rawTargetSSID: String?) -> Bool {
+    guard let targetSSID = rawTargetSSID?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nilIfEmpty else {
+        return false
+    }
+    return currentHotspotConnectionHealth(targetSSID: targetSSID)?.confirmsTargetConnection ?? false
+}
+
+public func savedWiFiNetworkNames() -> [String] {
+    var names: [String] = []
+    if let currentName = currentWiFiNetworkName(allowSlowLookup: false) {
+        names.append(currentName)
+    }
+    if let interface = wifiInterface() {
+        names.append(contentsOf: preferredWiFiNetworkNames(interface: interface))
+    }
+    return sortedUniqueNetworkNames(names)
+}
+
+public func availableWiFiNetworkNames(includeInstantHotspots: Bool = true) -> [String] {
+    var names = savedWiFiNetworkNames()
+    if let interface = wifiInterface() {
+        names.append(contentsOf: scannedWiFiNetworkNames(interface: interface))
+    }
+    if includeInstantHotspots {
+        names.append(contentsOf: InstantHotspotNameBrowser().names(timeout: 2))
+    }
+    return sortedUniqueNetworkNames(names)
 }
 
 public final class DownloadActivityMonitor {
@@ -619,15 +697,37 @@ private func run(_ executable: String, _ arguments: [String]) throws -> CommandR
     return CommandResult(status: process.terminationStatus, output: output, error: error)
 }
 
-private func currentDisableSleep() -> Int? {
-    guard let result = try? run("/usr/bin/pmset", ["-g", "custom"]) else { return nil }
-    for line in result.output.split(separator: "\n") {
-        let parts = line.split { $0 == " " || $0 == "\t" }
-        if parts.first == "disablesleep", parts.count >= 2 {
-            return Int(parts[1])
-        }
+public func sleepDisabledValue(fromPMSetOutput output: String) throws -> Int {
+    let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+    guard lines.contains(where: { $0.trimmingCharacters(in: .whitespaces) == "System-wide power settings:" }),
+          lines.contains(where: { $0.trimmingCharacters(in: .whitespaces) == "Currently in use:" }) else {
+        throw LidAwakeError("Unexpected output from /usr/bin/pmset -g.")
     }
-    return nil
+
+    for line in lines {
+        let parts = line.split { $0 == " " || $0 == "\t" }
+        guard parts.first == "SleepDisabled" else { continue }
+        guard parts.count >= 2,
+              let value = Int(parts[1]),
+              value == 0 || value == 1 else {
+            throw LidAwakeError("Invalid SleepDisabled value from /usr/bin/pmset -g: \(line.trimmingCharacters(in: .whitespaces)).")
+        }
+        return value
+    }
+
+    return 0
+}
+
+public func readSleepDisabled() throws -> Int {
+    let result = try run("/usr/bin/pmset", ["-g"])
+    guard result.status == 0 else {
+        throw LidAwakeError(result.errorOrOutput(defaultMessage: "/usr/bin/pmset -g failed."))
+    }
+    return try sleepDisabledValue(fromPMSetOutput: result.output)
+}
+
+private func currentDisableSleep() -> Int? {
+    try? readSleepDisabled()
 }
 
 private func setDisableSleep(_ value: Int) throws {
@@ -638,6 +738,9 @@ private func setDisableSleep(_ value: Int) throws {
         guard result.status == 0 else {
             throw LidAwakeError("pmset failed: \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
+        guard try readSleepDisabled() == value else {
+            throw LidAwakeError("SleepDisabled did not change to \(value).")
+        }
         return
     }
 
@@ -647,6 +750,9 @@ private func setDisableSleep(_ value: Int) throws {
     guard result.status == 0 else {
         let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
         throw LidAwakeError(message.isEmpty ? "Administrator authorization was cancelled or failed." : message)
+    }
+    guard try readSleepDisabled() == value else {
+        throw LidAwakeError("SleepDisabled did not change to \(value).")
     }
 }
 
@@ -669,15 +775,18 @@ private func removeState() {
     try? FileManager.default.removeItem(at: lidAwakeStateURL)
 }
 
-private func restoreDisableSleep() {
-    let previous = loadState()?.previousDisableSleep ?? 0
-    do {
-        try setDisableSleep(previous)
-        removeState()
-        print("Restored disablesleep=\(previous).")
-    } catch {
-        fputs("Failed to restore disablesleep: \(error.localizedDescription)\n", stderr)
+private func restoreDisableSleep() throws {
+    guard FileManager.default.fileExists(atPath: lidAwakeStateURL.path) else {
+        throw LidAwakeError("No saved NoAjar state was found; refusing to change SleepDisabled.")
     }
+    let data = try Data(contentsOf: lidAwakeStateURL)
+    let state = try JSONDecoder().decode(LidAwakeState.self, from: data)
+    guard let previous = state.previousDisableSleep else {
+        throw LidAwakeError("Saved NoAjar state does not contain the previous SleepDisabled value.")
+    }
+    try setDisableSleep(previous)
+    try FileManager.default.removeItem(at: lidAwakeStateURL)
+    print("Restored disablesleep=\(previous).")
 }
 
 private func createSleepAssertion(type: CFString, reason: String) throws -> IOPMAssertionID {
@@ -736,6 +845,47 @@ private func wifiInterface() -> String? {
     }
 
     return nil
+}
+
+private func preferredWiFiNetworkNames(interface: String) -> [String] {
+    guard let result = try? run("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", interface]),
+          result.status == 0 else {
+        return []
+    }
+
+    return result.output
+        .split(separator: "\n")
+        .dropFirst()
+        .compactMap { line in
+            String(line)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
+        }
+}
+
+private func scannedWiFiNetworkNames(interface: String) -> [String] {
+    guard let wifi = CWWiFiClient.shared().interface(withName: interface) else {
+        return []
+    }
+    guard let networks = try? wifi.scanForNetworks(withName: nil) else {
+        return []
+    }
+    return networks.compactMap { network in
+        network.ssid?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+}
+
+private func sortedUniqueNetworkNames(_ names: [String]) -> [String] {
+    var seen = Set<String>()
+    var unique: [String] = []
+    for name in names {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        let key = trimmed.lowercased()
+        guard seen.insert(key).inserted else { continue }
+        unique.append(trimmed)
+    }
+    return unique.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
 }
 
 private func currentWiFiSSID(interface: String, allowSlowLookup: Bool = false) -> String? {
@@ -834,6 +984,66 @@ private func wifiLinkIsActive(interface: String) -> Bool {
     return output.contains("LinkStatusActive : TRUE")
 }
 
+private func hotspotConnectionHealth(
+    interface: String,
+    targetSSID: String?,
+    allowSlowSSIDLookup: Bool = false
+) -> HotspotConnectionHealth {
+    let summary = ipconfigSummary(interface: interface)
+    let linkActive = summary?.contains("LinkStatusActive : TRUE") ?? false
+    let ifconfigOutput = wifiInterfaceOutput(interface: interface)
+    let signals = HotspotLinkSignals(ipconfigSummary: summary, ifconfigOutput: ifconfigOutput)
+    let gateway = wifiGateway(interface: interface)
+    let internetReachable = linkActive && networkResponds(interface: interface, gateway: gateway)
+    return HotspotConnectionHealth(
+        interface: interface,
+        currentSSID: currentWiFiSSID(interface: interface, allowSlowLookup: allowSlowSSIDLookup),
+        targetSSID: targetSSID,
+        linkActive: linkActive,
+        gateway: gateway,
+        internetReachable: internetReachable,
+        usesIPv6Translation: signals.usesIPv6Translation,
+        hasConstrainedHotspotAddress: signals.hasConstrainedHotspotAddress
+    )
+}
+
+private func healthForTargetConfirmation(
+    interface: String,
+    targetSSID: String,
+    current health: HotspotConnectionHealth
+) -> HotspotConnectionHealth {
+    guard health.linkActive, health.currentSSID == nil else {
+        return health
+    }
+    return hotspotConnectionHealth(
+        interface: interface,
+        targetSSID: targetSSID,
+        allowSlowSSIDLookup: true
+    )
+}
+
+private func successfulKeepaliveResult(from health: HotspotConnectionHealth) -> HotspotKeepaliveResult? {
+    guard health.linkActive, health.internetReachable else {
+        return nil
+    }
+    if let targetSSID = health.targetSSID {
+        guard health.confirmsTargetConnection else {
+            return nil
+        }
+        if health.currentSSID == targetSSID {
+            return HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: \(targetSSID) is reachable.")
+        }
+        return HotspotKeepaliveResult(
+            success: true,
+            message: "Hotspot Keepalive: hotspot link is reachable without a visible SSID."
+        )
+    }
+    if let gateway = health.gateway {
+        return HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: gateway \(gateway) reached.")
+    }
+    return HotspotKeepaliveResult(success: true, message: "Hotspot Keepalive: internet is reachable.")
+}
+
 private func wifiGateway(interface: String) -> String? {
     if let output = ipconfigSummary(interface: interface) {
         for rawLine in output.split(separator: "\n").map(String.init) {
@@ -872,8 +1082,16 @@ private func defaultRouteGateway(interface: String) -> String? {
     return gateway?.nilIfEmpty
 }
 
-private func networkResponds(interface: String, gateway: String) -> Bool {
-    if pingResponds(interface: interface, host: gateway) {
+private func wifiInterfaceOutput(interface: String) -> String? {
+    guard let result = try? run("/sbin/ifconfig", [interface]),
+          result.status == 0 else {
+        return nil
+    }
+    return result.output
+}
+
+private func networkResponds(interface: String, gateway: String?) -> Bool {
+    if let gateway, pingResponds(interface: interface, host: gateway) {
         return true
     }
     return pingResponds(interface: interface, host: "1.1.1.1")
@@ -902,8 +1120,13 @@ private func reconnectToWiFi(interface: String, ssid: String) -> HotspotKeepaliv
         }
 
         let connectedSSID = waitForWiFiConnection(interface: interface, ssid: ssid)
-        let connectedToTarget = connectedSSID.map { $0 == ssid } ?? true
-        guard wifiLinkIsActive(interface: interface), connectedToTarget else {
+        let health = healthForTargetConfirmation(
+            interface: interface,
+            targetSSID: ssid,
+            current: hotspotConnectionHealth(interface: interface, targetSSID: ssid)
+        )
+        let connectedToTarget = connectedSSID.map { $0 == ssid } ?? health.confirmsTargetConnection
+        guard health.linkActive, health.internetReachable, connectedToTarget else {
             let currentText = connectedSSID.map { " Still on \($0)." } ?? ""
             return HotspotKeepaliveResult(
                 success: false,
@@ -944,8 +1167,13 @@ private func reconnectToWiFiAndExit(
         }
 
         let connectedSSID = waitForWiFiConnection(interface: interface, ssid: ssid)
-        let connectedToTarget = connectedSSID.map { $0 == ssid } ?? true
-        guard wifiLinkIsActive(interface: interface), connectedToTarget else {
+        let health = healthForTargetConfirmation(
+            interface: interface,
+            targetSSID: ssid,
+            current: hotspotConnectionHealth(interface: interface, targetSSID: ssid)
+        )
+        let connectedToTarget = connectedSSID.map { $0 == ssid } ?? health.confirmsTargetConnection
+        guard health.linkActive, health.internetReachable, connectedToTarget else {
             let currentText = connectedSSID.map { " Still on \($0)." } ?? ""
             exitHandler(HotspotKeepaliveResult(
                 success: false,
@@ -976,7 +1204,9 @@ private func instantHotspotEnableErrorMayHaveStartedHotspot(_ message: String) -
         .replacingOccurrences(of: "\u{2019}", with: "'")
     return normalized.contains("tmperr") ||
         normalized.contains("couldn't be completed") ||
-        normalized.contains("could not be completed")
+        normalized.contains("could not be completed") ||
+        normalized.contains("did not return wi-fi credentials") ||
+        normalized.contains("did not return wifi credentials")
 }
 
 private struct InstantHotspotCredentials {
@@ -1113,6 +1343,7 @@ private func joinInstantHotspotNetwork(
     password: String
 ) -> HotspotKeepaliveResult {
     let previousGateway = wifiGateway(interface: interface)
+    var lastJoinMessage = "Instant Hotspot network was not found in Wi-Fi scan."
     do {
         let result = try run("/usr/sbin/networksetup", ["-setairportnetwork", interface, networkName, password])
         let message = result.combinedMessage(defaultMessage: "networksetup failed.")
@@ -1130,16 +1361,47 @@ private func joinInstantHotspotNetwork(
             )
         }
         if !networkSetupMessageIndicatesMissingNetwork(message) {
+            guard instantHotspotEnableErrorMayHaveStartedHotspot(message) else {
+                return HotspotKeepaliveResult(
+                    success: false,
+                    message: "Hotspot Keepalive: Instant Hotspot \(deviceName) was enabled, but Wi-Fi join failed: \(message)."
+                )
+            }
+            lastJoinMessage = message
+            if waitForInstantHotspotConnection(
+                interface: interface,
+                ssid: networkName,
+                previousGateway: previousGateway,
+                timeout: 24
+            ) {
+                return HotspotKeepaliveResult(
+                    success: true,
+                    message: "Hotspot Keepalive: connected to Instant Hotspot \(deviceName).",
+                    didReconnect: true
+                )
+            }
+        }
+    } catch {
+        let message = error.localizedDescription
+        guard instantHotspotEnableErrorMayHaveStartedHotspot(message) else {
             return HotspotKeepaliveResult(
                 success: false,
                 message: "Hotspot Keepalive: Instant Hotspot \(deviceName) was enabled, but Wi-Fi join failed: \(message)."
             )
         }
-    } catch {
-        return HotspotKeepaliveResult(
-            success: false,
-            message: "Hotspot Keepalive: Instant Hotspot \(deviceName) was enabled, but Wi-Fi join failed: \(error.localizedDescription)."
-        )
+        lastJoinMessage = message
+        if waitForInstantHotspotConnection(
+            interface: interface,
+            ssid: networkName,
+            previousGateway: previousGateway,
+            timeout: 24
+        ) {
+            return HotspotKeepaliveResult(
+                success: true,
+                message: "Hotspot Keepalive: connected to Instant Hotspot \(deviceName).",
+                didReconnect: true
+            )
+        }
     }
 
     guard let wifi = CWWiFiClient.shared().interface(withName: interface) else {
@@ -1150,7 +1412,7 @@ private func joinInstantHotspotNetwork(
     }
 
     let deadline = Date().addingTimeInterval(18)
-    var lastMessage = "Instant Hotspot network was not found in Wi-Fi scan."
+    var lastMessage = lastJoinMessage
     while Date() < deadline {
         do {
             let networks = try wifi.scanForNetworks(withName: networkName)
@@ -1190,17 +1452,25 @@ private func joinInstantHotspotNetwork(
 private func waitForWiFiConnection(interface: String, ssid: String) -> String? {
     let deadline = Date().addingTimeInterval(8)
     while Date() < deadline {
-        if wifiLinkIsActive(interface: interface),
-           currentWiFiSSID(interface: interface) == ssid {
+        let health = healthForTargetConfirmation(
+            interface: interface,
+            targetSSID: ssid,
+            current: hotspotConnectionHealth(interface: interface, targetSSID: ssid)
+        )
+        if health.currentSSID == ssid {
             return ssid
+        }
+        if health.confirmsTargetConnection {
+            return nil
         }
         Thread.sleep(forTimeInterval: 1)
     }
 
-    guard wifiLinkIsActive(interface: interface) else {
+    let health = hotspotConnectionHealth(interface: interface, targetSSID: ssid, allowSlowSSIDLookup: true)
+    guard health.linkActive else {
         return nil
     }
-    return currentWiFiSSID(interface: interface, allowSlowLookup: true)
+    return health.currentSSID
 }
 
 private final class HotspotResultWaiter: @unchecked Sendable {
@@ -1330,6 +1600,122 @@ private func callObjCVoidTwoObjects(
     let function = unsafeBitCast(method_getImplementation(method), to: ObjCVoidTwoObjectsIMP.self)
     function(object, selector, firstArgument, secondArgument)
     return true
+}
+
+private final class NetworkNameResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: [String] = []
+
+    func set(_ value: [String]) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private final class InstantHotspotNameBrowser: NSObject, @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: NSObject?
+    private var foundNames = Set<String>()
+
+    func names(timeout: TimeInterval) -> [String] {
+        if Thread.isMainThread {
+            return namesOnMain(timeout: timeout)
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        let result = NetworkNameResultBox()
+
+        DispatchQueue.main.async {
+            self.startBrowsing()
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                self.stopBrowsing()
+                result.set(sortedUniqueNetworkNames(Array(self.snapshot())))
+                semaphore.signal()
+            }
+        }
+
+        guard semaphore.wait(timeout: .now() + timeout + 1) == .success else {
+            return []
+        }
+        return result.get()
+    }
+
+    private func namesOnMain(timeout: TimeInterval) -> [String] {
+        startBrowsing()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        }
+        stopBrowsing()
+        return sortedUniqueNetworkNames(Array(snapshot()))
+    }
+
+    private func startBrowsing() {
+        guard session == nil else { return }
+        guard dlopen("/System/Library/PrivateFrameworks/Sharing.framework/Sharing", RTLD_NOW) != nil,
+              let sessionClass = NSClassFromString("SFRemoteHotspotSession") as? NSObject.Type else {
+            return
+        }
+
+        let session = sessionClass.init()
+        self.session = session
+        guard callObjCVoidObject(session, "setDelegate:", self),
+              callObjCVoid(session, "startBrowsing") else {
+            self.session = nil
+            return
+        }
+    }
+
+    private func stopBrowsing() {
+        guard let session else { return }
+        callObjCVoid(session, "stopBrowsing")
+        callObjCVoidObject(session, "setDelegate:", nil)
+        self.session = nil
+    }
+
+    private func snapshot() -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return foundNames
+    }
+
+    @objc private func updatedFoundDeviceList(_ devices: Any) {
+        handleUpdatedFoundDevices(devices)
+    }
+
+    @objc private func session(_ session: Any, updatedFoundDevices devices: Any) {
+        handleUpdatedFoundDevices(devices)
+    }
+
+    private func handleUpdatedFoundDevices(_ devices: Any) {
+        let deviceList: [Any]
+        if let array = devices as? [Any] {
+            deviceList = array
+        } else if let array = devices as? NSArray {
+            deviceList = array.map { $0 }
+        } else {
+            return
+        }
+
+        let names = deviceList.compactMap { rawDevice -> String? in
+            let device = rawDevice as AnyObject
+            let name = (device.value(forKey: "deviceName") as? String)
+                ?? (device.value(forKey: "name") as? String)
+            return name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        }
+        guard !names.isEmpty else { return }
+
+        lock.lock()
+        foundNames.formUnion(names)
+        lock.unlock()
+    }
 }
 
 private final class InstantHotspotConnector: NSObject, @unchecked Sendable {
@@ -1672,8 +2058,8 @@ private final class InstantHotspotConnector: NSObject, @unchecked Sendable {
     }
 
     private func waitForInstantHotspotConnectionOnMain(networkName: String, deadline: Date, lastMessage: String) {
-        if currentWiFiSSID(interface: interface, allowSlowLookup: false) == networkName ||
-            (wifiLinkIsActive(interface: interface) && defaultRouteUsesInterface(interface)) {
+        let health = hotspotConnectionHealth(interface: interface, targetSSID: networkName)
+        if health.confirmsTargetConnection {
             complete(HotspotKeepaliveResult(
                 success: true,
                 message: "Hotspot Keepalive: connected to Instant Hotspot \(deviceName).",
@@ -1742,19 +2128,21 @@ private func waitForInstantHotspotConnection(
 ) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        if currentWiFiSSID(interface: interface, allowSlowLookup: true) == ssid {
+        let health = hotspotConnectionHealth(interface: interface, targetSSID: ssid)
+        if health.confirmsTargetConnection {
             return true
         }
-        if wifiLinkIsActive(interface: interface),
+        if health.linkActive,
+           health.internetReachable,
            defaultRouteUsesInterface(interface),
-           let gateway = wifiGateway(interface: interface),
+           let gateway = health.gateway,
            gateway != previousGateway {
             return true
         }
         Thread.sleep(forTimeInterval: 1)
     }
 
-    return currentWiFiSSID(interface: interface, allowSlowLookup: true) == ssid
+    return hotspotConnectionHealth(interface: interface, targetSSID: ssid).confirmsTargetConnection
 }
 
 private func defaultRouteUsesInterface(_ interface: String) -> Bool {

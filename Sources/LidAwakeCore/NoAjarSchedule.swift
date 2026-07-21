@@ -15,6 +15,7 @@ public struct NoAjarScheduleRule: Codable, Equatable, Identifiable {
     public var enabled: Bool
     public var mode: AwakeMode
     public var keepHotspotConnected: Bool
+    public var networkSSID: String?
     public var weekdays: [Int]
     public var startMinute: Int
     public var endMinute: Int
@@ -24,6 +25,7 @@ public struct NoAjarScheduleRule: Codable, Equatable, Identifiable {
         enabled: Bool = true,
         mode: AwakeMode = .noAjar,
         keepHotspotConnected: Bool = false,
+        networkSSID: String? = nil,
         weekdays: [Int] = [2, 3, 4, 5, 6],
         startMinute: Int = 9 * 60,
         endMinute: Int = 18 * 60
@@ -32,6 +34,7 @@ public struct NoAjarScheduleRule: Codable, Equatable, Identifiable {
         self.enabled = enabled
         self.mode = mode
         self.keepHotspotConnected = keepHotspotConnected
+        self.networkSSID = networkSSID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.weekdays = weekdays
         self.startMinute = startMinute
         self.endMinute = endMinute
@@ -42,6 +45,7 @@ public struct NoAjarScheduleRule: Codable, Equatable, Identifiable {
         case enabled
         case mode
         case keepHotspotConnected
+        case networkSSID
         case weekdays
         case startMinute
         case endMinute
@@ -52,7 +56,11 @@ public struct NoAjarScheduleRule: Codable, Equatable, Identifiable {
         id = try container.decode(String.self, forKey: .id)
         enabled = try container.decode(Bool.self, forKey: .enabled)
         mode = try container.decode(AwakeMode.self, forKey: .mode)
-        keepHotspotConnected = try container.decodeIfPresent(Bool.self, forKey: .keepHotspotConnected) ?? false
+        networkSSID = try container
+            .decodeIfPresent(String.self, forKey: .networkSSID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        keepHotspotConnected = try container.decodeIfPresent(Bool.self, forKey: .keepHotspotConnected) ?? (networkSSID != nil)
         weekdays = try container.decode([Int].self, forKey: .weekdays)
         startMinute = try container.decode(Int.self, forKey: .startMinute)
         endMinute = try container.decode(Int.self, forKey: .endMinute)
@@ -271,4 +279,10 @@ private struct WeeklyInterval {
     let ruleID: String
     let start: Int
     let end: Int
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
 }
